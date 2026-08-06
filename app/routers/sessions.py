@@ -98,12 +98,12 @@ async def chat_stream(session_id: str, req: ChatRequest) -> StreamingResponse:
                 if not isinstance(chunk, dict):
                     continue
                 yield f"data: {_serialize(chunk)}\n\n"
-            yield "data: {\"type\": \"end\"}\n\n"
+            yield 'data: {"type": "end"}\n\n'
         except ValueError as e:
-            yield f"data: {{\"type\": \"error\", \"detail\": {str(e)!r}}}\n\n"
+            yield f'data: {{"type": "error", "detail": {str(e)!r}}}\n\n'
         except Exception as e:
             logger.error("对话流失败: {}", e)
-            yield f"data: {{\"type\": \"error\", \"detail\": {str(e)!r}}}\n\n"
+            yield f'data: {{"type": "error", "detail": {str(e)!r}}}\n\n'
 
     return StreamingResponse(
         event_gen(),
@@ -147,7 +147,5 @@ def _msg_to_dict(msg: Any) -> dict:
     }
     tool_calls = getattr(msg, "tool_calls", None) or []
     if tool_calls:
-        d["tool_calls"] = [
-            {"name": tc.get("name"), "args": tc.get("args"), "id": tc.get("id")} for tc in tool_calls
-        ]
+        d["tool_calls"] = [{"name": tc.get("name"), "args": tc.get("args"), "id": tc.get("id")} for tc in tool_calls]
     return d

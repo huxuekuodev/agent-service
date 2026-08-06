@@ -39,15 +39,8 @@ dev = [
 ]
 
 [tool.uv]
-index-url = "https://pypi.org/simple"
+index-url = "https://mirrors.aliyun.com/pypi/simple/"
 
 [tool.pyrefly]
 python-interpreter = ".venv/bin/python3"
 project-includes = ["."]
-
-[tool.ruff]
-line-length = 240
-target-version = "py312"
-
-[tool.ruff.lint]
-select = ["E", "F", "I", "UP"]

@@ -97,8 +97,4 @@ def _load_local_general_prompt(tools_desc: str) -> str:
     if path.exists():
         content = path.read_text(encoding="utf-8")
         return content.replace("{{tools_desc}}", tools_desc or "")
-    return (
-        "你是通用执行节点，负责完成分配的任务。\n"
-        "可用工具:\n{tools_desc}\n"
-        "请执行任务并返回结果。"
-    ).format(tools_desc=tools_desc or "")
+    return ("你是通用执行节点，负责完成分配的任务。\n可用工具:\n{tools_desc}\n请执行任务并返回结果。").format(tools_desc=tools_desc or "")

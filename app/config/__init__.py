@@ -16,6 +16,7 @@ from typing import Any
 
 import yaml
 
+
 # 环境变量引用：$VAR 会被替换为环境变量的值
 def _resolve_env(value: Any) -> Any:
     """将 $VAR 字符串替换为环境变量值。"""
@@ -198,10 +199,7 @@ class AppConfig:
         """从 YAML 文件加载配置。"""
         config_path = Path(path) if path else _find_config_file()
         if config_path is None:
-            raise FileNotFoundError(
-                "config.yaml not found. Create config.yaml (see config.example.yaml) "
-                "or set AGENT_CONFIG_PATH."
-            )
+            raise FileNotFoundError("config.yaml not found. Create config.yaml (see config.example.yaml) or set AGENT_CONFIG_PATH.")
 
         with open(config_path, encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}

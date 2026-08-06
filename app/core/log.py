@@ -14,11 +14,7 @@ from loguru import logger
 from app.core.context import trace_id_ctx_var
 
 # 配置日志格式
-log_format = (
-    "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | "
-    "<magenta>trace_id - {extra[trace_id]}</magenta> | "
-    "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
-)
+log_format = "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <magenta>trace_id - {extra[trace_id]}</magenta> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
 
 
 def _resolve_log_level() -> tuple[str, str | None]:

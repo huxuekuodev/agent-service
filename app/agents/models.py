@@ -10,7 +10,6 @@ from typing import Any
 
 from langchain.chat_models import BaseChatModel
 
-from app.config import ModelConfig
 from app.core.reflection import resolve_class
 
 
@@ -59,7 +58,6 @@ def create_chat_model(
         model_kwargs["timeout"] = model_config.timeout
     if model_config.max_retries is not None:
         model_kwargs["max_retries"] = model_config.max_retries
-
 
     # 合并额外 kwargs
     model_kwargs.update(kwargs)

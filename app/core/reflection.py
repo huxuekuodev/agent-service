@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from importlib import import_module
-from typing import Any, TypeVar, cast
+from typing import TypeVar, cast
 
 T = TypeVar("T")
 
@@ -44,14 +44,11 @@ def resolve_variable(
         raise ImportError(f"Module {module_path} has no attribute {variable_name}") from err
 
     if expected_type is not None and not isinstance(variable, expected_type):
-        raise ValueError(
-            f"Variable {variable_path} resolved to {type(variable).__name__}, "
-            f"expected {expected_type}"
-        )
+        raise ValueError(f"Variable {variable_path} resolved to {type(variable).__name__}, expected {expected_type}")
     return cast(T, variable)
 
 
-def resolve_class(
+def resolve_class(  # noqa: UP047
     variable_path: str,
     base_class: type[T] | tuple[type[T], ...],
 ) -> type[T]:

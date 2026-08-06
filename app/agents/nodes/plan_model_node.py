@@ -25,8 +25,6 @@ from langgraph.runtime import Runtime
 from langgraph.types import Overwrite
 from pydantic import BaseModel, Field
 
-from app.agents.middlewares.clarification_middleware import ClarificationMiddleware
-from app.agents.middlewares.dangling_tool_call_middleware import DanglingToolCallMiddleware
 from app.agents.current_time import has_current_time_for_today
 from app.agents.errors import build_error_fallback_message, classify_llm_error
 from app.agents.evaluation.plan_evaluator import (
@@ -35,6 +33,8 @@ from app.agents.evaluation.plan_evaluator import (
     PlanEvaluator,
 )
 from app.agents.lead_agent import GraphContext, create_llm_with_name
+from app.agents.middlewares.clarification_middleware import ClarificationMiddleware
+from app.agents.middlewares.dangling_tool_call_middleware import DanglingToolCallMiddleware
 from app.agents.nodes.constants import THINK_MES
 from app.agents.subtask import SubTask
 from app.agents.thread_state import ThreadState
@@ -82,16 +82,9 @@ def _load_local_prompt(filename: str, agent_descriptions: str, capability_descri
     path = prompt_dir / filename
     if path.exists():
         content = path.read_text(encoding="utf-8")
-        return content.replace("{{agent_descriptions}}", agent_descriptions or "").replace(
-            "{{capability_descriptions}}", capability_descriptions or ""
-        )
+        return content.replace("{{agent_descriptions}}", agent_descriptions or "").replace("{{capability_descriptions}}", capability_descriptions or "")
     # 极简兜底
-    return (
-        "你是任务规划节点。\n"
-        "可用 agent:\n{agent_descriptions}\n"
-        "执行工具:\n{capability_descriptions}\n"
-        "请将用户需求拆解为原子任务，输出 JSON。"
-    ).format(
+    return ("你是任务规划节点。\n可用 agent:\n{agent_descriptions}\n执行工具:\n{capability_descriptions}\n请将用户需求拆解为原子任务，输出 JSON。").format(
         agent_descriptions=agent_descriptions or "",
         capability_descriptions=capability_descriptions or "",
     )
