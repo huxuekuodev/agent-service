@@ -1,0 +1,76 @@
+config_version: 1
+log_level: INFO
+logging:
+  level: INFO
+  file:
+
+# 模型列表，第一个为默认模型
+models:
+  - name: default
+    display_name: "DeepSeek"
+    use: langchain_deepseek:ChatDeepSeek
+    model: deepseek-chat
+    api_key: $DEEPSEEK_API_KEY
+    base_url:
+    max_tokens: 8192
+    timeout: 600.0
+    max_retries: 2
+    supports_thinking: false
+    supports_vision: false
+  - name: plan_node_model
+    display_name: "规划节点模型"
+    use: langchain_deepseek:ChatDeepSeek
+    model: deepseek-chat
+    api_key: $DEEPSEEK_API_KEY
+    base_url:
+    max_tokens: 8192
+    timeout: 600.0
+    max_retries: 2
+    supports_thinking: false
+    supports_vision: false
+  - name: general_node_model
+    display_name: "执行节点模型"
+    use: langchain_deepseek:ChatDeepSeek
+    model: deepseek-chat
+    api_key: $DEEPSEEK_API_KEY
+    base_url:
+    max_tokens: 8192
+    timeout: 600.0
+    max_retries: 2
+    supports_thinking: false
+    supports_vision: false
+  - name: evaluate_model
+    display_name: "评估模型"
+    use: langchain_deepseek:ChatDeepSeek
+    model: deepseek-chat
+    api_key: $DEEPSEEK_API_KEY
+    base_url:
+    max_tokens: 8192
+    timeout: 600.0
+    max_retries: 2
+    supports_thinking: false
+    supports_vision: false
+
+# Langfuse 追踪/评估
+langfuse:
+  enabled: false
+  public_key:
+  secret_key:
+  host: https://cloud.langfuse.com
+
+# 规划评估（LLM-as-Judge）
+plan_evaluation:
+  enabled: false
+  sample_rate: 1.0
+  judge_model: evaluate_model
+  dimensions:
+    clarification_quality: true
+    task_atomicity: true
+    agent_selection_validity: true
+
+# 执行 agent 配置
+subagents:
+  custom_agents: {}
+
+# 数据存储
+storage_dir: .deer-agent
