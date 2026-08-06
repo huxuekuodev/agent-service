@@ -59,9 +59,9 @@ async def general_agent(state: ThreadState, config: RunnableConfig, runtime: Run
     else:
         system_prompt = _load_local_general_prompt(tools_desc)
     task_info = f"""任务名称：{task_name}
-任务描述：{task_desc}
-计划 ID：{plan_id}
-<current_time>{runtime.context.current_time}</current_time>"""
+                        任务描述：{task_desc}
+                        计划 ID：{plan_id}
+                        <current_time>{runtime.context.current_time}</current_time>"""
 
     llm = create_llm_with_name(config, model_name="general_node_model")
     # create_agent 的 tools 参数会在内部自动 bind_tools，无需手动绑定

@@ -74,3 +74,11 @@ subagents:
 
 # 数据存储
 storage_dir: .deer-agent
+
+# 数据库（checkpointer 共享存储）
+# 集群部署必须用 postgres，多节点共享会话状态
+# 单机开发可用 memory（重启丢状态）
+database:
+  backend: memory  # memory | postgres
+  postgres_url: $DATABASE_URL
+

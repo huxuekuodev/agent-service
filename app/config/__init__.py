@@ -153,6 +153,24 @@ class LoggingConfig:
 
 
 @dataclass
+class DatabaseConfig:
+    """数据库配置（checkpointer 共享存储）。"""
+
+    backend: str = "memory"
+    """memory | sqlite | postgres。集群部署用 postgres。"""
+    postgres_url: str = ""
+    """PostgreSQL 连接 URL，如 postgresql://user:pass@host:5432/db。"""
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "DatabaseConfig":
+        d = d or {}
+        return cls(
+            backend=str(d.get("backend", "memory")),
+            postgres_url=_resolve_env(d.get("postgres_url", "")),
+        )
+
+
+@dataclass
 class AppConfig:
     """独立服务的全局配置。"""
 
@@ -173,6 +191,7 @@ class AppConfig:
 
     # 数据存储（会话/线程持久化）
     storage_dir: str = ".deer-agent"
+    database: DatabaseConfig = field(default_factory=DatabaseConfig)
 
     @classmethod
     def from_file(cls, path: str | None = None) -> "AppConfig":
@@ -201,6 +220,7 @@ class AppConfig:
             plan_evaluation=PlanEvaluationSettings.from_dict(data.get("plan_evaluation")),
             subagents=SubagentsSettings.from_dict(data.get("subagents")),
             storage_dir=str(data.get("storage_dir", ".deer-agent")),
+            database=DatabaseConfig.from_dict(data.get("database")),
         )
 
     def get_model_config(self, name: str) -> ModelConfig | None:

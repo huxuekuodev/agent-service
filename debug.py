@@ -18,14 +18,12 @@ import asyncio
 import uuid
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.runnables import RunnableConfig
 
 from app.agents.lead_agent.agent import GraphAgent
 from app.config import get_app_config
 from app.core.context import trace_id_ctx_var
 from app.core.log import logger
 from app.core.runtime import RunContext
-from langgraph.checkpoint.memory import InMemorySaver
 
 
 class StreamPrinter:
@@ -156,24 +154,20 @@ async def main():
     app_config = get_app_config()
     from langchain_core.messages import HumanMessage
 
-    config: RunnableConfig = {
-        "configurable": {
-            "thread_id": "debug-thread-001",
-            "model_name": app_config.default_model.name,
-            "trace_id": trace_id,
-        }
-    }
+    from app.core.checkpointer import create_checkpointer
 
-    # 独立服务：使用 InMemorySaver 作为 checkpointer
-    checkpointer = InMemorySaver()
+    # 独立服务：从 config.yaml 的 database 段创建共享 checkpointer
+    checkpointer = create_checkpointer(app_config)
     runcontext = RunContext(checkpointer=checkpointer, app_config=app_config)
-    agent = GraphAgent(config, runcontext)
+    # 无状态图：全局复用，thread_id 每次传入
+    agent = GraphAgent(runcontext)
     userquery = "查询河北今天天气最凉爽的城市"
     state = {"messages": [HumanMessage(content=userquery)]}
+    thread_id = "debug-thread-001"
 
     # 使用成熟的消息打印器
     printer = StreamPrinter()
-    async for chunk in agent.astream(state):
+    async for chunk in agent.astream(state, thread_id=thread_id, trace_id=trace_id):
         printer.handle_chunk(chunk)
 
     # 提取最终答案

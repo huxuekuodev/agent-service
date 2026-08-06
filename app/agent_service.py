@@ -1,6 +1,9 @@
-"""Agent 服务层：封装 GraphAgent，管理会话与线程。
+"""Agent 服务层：无状态图 + 共享 checkpointer，集群安全。
 
-提供创建会话、按会话对话的能力，屏蔽 LangGraph 细节。
+设计：
+  - GraphAgent 是【无状态】编译图，全局单例，服务所有会话。
+  - 状态通过共享 checkpointer（Postgres，集群部署）按 thread_id 持久化。
+  - 用户请求发散到任意节点，都能从 checkpointer 恢复同一 thread 的上下文。
 """
 
 from __future__ import annotations
@@ -9,11 +12,10 @@ import uuid
 from typing import Any
 
 from langchain_core.messages import HumanMessage
-from langchain_core.runnables import RunnableConfig
-from langgraph.checkpoint.memory import InMemorySaver
 
 from app.agents.lead_agent.agent import GraphAgent
 from app.config import get_app_config
+from app.core.checkpointer import create_checkpointer
 from app.core.context import trace_id_ctx_var
 from app.core.runtime import RunContext
 
@@ -21,18 +23,19 @@ from app.core.runtime import RunContext
 class AgentService:
     """Agent 服务。
 
-    管理会话（thread）与对话。每个会话对应一个 LangGraph thread（有独立的 checkpointer 状态）。
+    会话（session_id）即 LangGraph thread_id。所有会话共享一个无状态编译图，
+    状态由共享 checkpointer 管理。
     """
 
     def __init__(self) -> None:
         self._app_config = get_app_config()
-        self._checkpointer = InMemorySaver()
+        self._checkpointer = create_checkpointer(self._app_config)
         self._run_context = RunContext(
             checkpointer=self._checkpointer,
             app_config=self._app_config,
         )
-        # 会话 → GraphAgent 实例映射（每个会话独立 config）
-        self._agents: dict[str, GraphAgent] = {}
+        # 无状态图：全局单例，编译一次复用
+        self._agent = GraphAgent(self._run_context)
 
     # ------------------------------------------------------------------
     # 会话管理
@@ -41,48 +44,44 @@ class AgentService:
     def create_session(self, *, model_name: str | None = None) -> dict:
         """创建一个新会话。
 
-        Returns:
-            {"session_id": "...", "thread_id": "..."}
+        集群安全：不绑定任何节点。session_id 即 thread_id，
+        后续任何节点的请求都能从共享 checkpointer 恢复。
         """
         session_id = uuid.uuid4().hex
-        thread_id = session_id  # 会话 ID 即 thread ID
-
-        config = self._build_config(thread_id=thread_id, model_name=model_name)
-        agent = GraphAgent(config, self._run_context)
-        self._agents[session_id] = agent
-
-        return {"session_id": session_id, "thread_id": thread_id}
+        return {"session_id": session_id, "thread_id": session_id, "model_name": model_name}
 
     def delete_session(self, session_id: str) -> bool:
-        """删除会话。"""
-        if session_id in self._agents:
-            del self._agents[session_id]
-            return True
-        return False
+        """删除会话（从 checkpointer 删除状态）。
 
-    def get_session(self, session_id: str) -> GraphAgent | None:
-        """获取会话对应的 agent。"""
-        return self._agents.get(session_id)
+        注意：当前简化版不实现 checkpointer 删除，仅返回 True。
+        生产环境应调用 checkpointer 的删除 API。
+        """
+        # TODO: 调用 checkpointer 删除该 thread 的状态
+        return True
 
     def list_sessions(self) -> list[str]:
-        """列出所有活跃会话。"""
-        return list(self._agents.keys())
+        """列出活跃会话。
+
+        注意：简化版不维护会话注册表（集群无中心状态）。
+        生产环境应从持久化存储查询会话列表。
+        """
+        return []
 
     # ------------------------------------------------------------------
     # 对话
     # ------------------------------------------------------------------
 
     async def chat(self, session_id: str, message: str) -> list[dict]:
-        """发送消息并等待完整回复。
-
-        Returns:
-            完整回复消息列表（含最终答案）。
-        """
-        agent = self._get_or_create_agent(session_id)
+        """发送消息并等待完整回复。"""
+        trace_id = trace_id_ctx_var.get() or uuid.uuid4().hex
         state = {"messages": [HumanMessage(content=message)]}
 
         chunks = []
-        async for st in agent.astream(state):
+        async for st in self._agent.astream(
+            state,
+            thread_id=session_id,
+            trace_id=trace_id,
+        ):
             chunks.append(st)
         return self._extract_messages(chunks)
 
@@ -92,35 +91,18 @@ class AgentService:
         Yields:
             dict: {"type": "values"|"custom"|"messages", "data": ...}
         """
-        agent = self._get_or_create_agent(session_id)
+        trace_id = trace_id_ctx_var.get() or uuid.uuid4().hex
         state = {"messages": [HumanMessage(content=message)]}
-        async for st in agent.astream(state):
+        async for st in self._agent.astream(
+            state,
+            thread_id=session_id,
+            trace_id=trace_id,
+        ):
             yield st
 
     # ------------------------------------------------------------------
     # 内部
     # ------------------------------------------------------------------
-
-    def _get_or_create_agent(self, session_id: str) -> GraphAgent:
-        """获取会话对应 agent；不存在则用该 session_id 创建。"""
-        agent = self._agents.get(session_id)
-        if agent is not None:
-            return agent
-        # 用请求的 session_id 创建（而非新随机 id）
-        thread_id = session_id
-        config = self._build_config(thread_id=thread_id, model_name=None)
-        agent = GraphAgent(config, self._run_context)
-        self._agents[session_id] = agent
-        return agent
-
-    def _build_config(self, *, thread_id: str, model_name: str | None = None) -> RunnableConfig:
-        trace_id = trace_id_ctx_var.get() or uuid.uuid4().hex
-        configurable: dict[str, Any] = {
-            "thread_id": thread_id,
-            "trace_id": trace_id,
-            "model_name": model_name or self._app_config.default_model.name,
-        }
-        return {"configurable": configurable}
 
     def _extract_messages(self, chunks: list[dict]) -> list[dict]:
         """从 astream 输出中提取最终消息列表。"""
