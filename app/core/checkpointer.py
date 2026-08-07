@@ -13,6 +13,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from psycopg import AsyncConnection
+from psycopg_pool import AsyncConnectionPool
+
 logger = logging.getLogger(__name__)
 
 
@@ -47,21 +50,17 @@ def create_checkpointer(app_config: Any) -> Any:
     return InMemorySaver()
 
 
-def _create_postgres_checkpointer(url: str) -> Any:
-    """创建 Postgres checkpointer。
-
-    注意：AsyncPostgresSaver 需要连接池，且需调用 setup() 建表。
-    这里返回一个 context manager 包装，由调用方管理生命周期。
-    """
-    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+def _build_postgres_pool(conn_string: str) -> AsyncConnectionPool[AsyncConnection[Any]]:
+    """Build an AsyncConnectionPool with TCP keepalive and connection checking."""
+    from psycopg.rows import dict_row
     from psycopg_pool import AsyncConnectionPool
 
-    pool = AsyncConnectionPool(
-        url,
+    return AsyncConnectionPool(
+        conn_string,
         kwargs={
             "autocommit": True,
             "prepare_threshold": 0,
-            "row_factory": "dict_row",
+            "row_factory": dict_row,
             "keepalives": 1,
             "keepalives_idle": 60,
             "keepalives_interval": 10,
@@ -69,6 +68,19 @@ def _create_postgres_checkpointer(url: str) -> Any:
         },
         check=AsyncConnectionPool.check_connection,
     )
+
+
+def _create_postgres_checkpointer(url: str) -> PostgresCheckpointerHandle:
+    """创建 Postgres checkpointer。
+
+    返回 PostgresCheckpointerHandle（async context manager 包装）：
+      - 持有 AsyncPostgresSaver + AsyncConnectionPool
+      - 由调用方 __aenter__ 进入（打开池 + setup 建表）
+      - __aexit__ 释放连接池
+    """
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+    pool = _build_postgres_pool(url)
     saver = AsyncPostgresSaver(conn=pool)
     return PostgresCheckpointerHandle(saver, pool)
 

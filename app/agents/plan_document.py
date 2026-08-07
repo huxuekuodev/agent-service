@@ -49,7 +49,7 @@ class PlanDocument(BaseModel):
     plan_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     title: str = ""
     steps: list[str] = Field(default_factory=list)
-    dependencies: dict[int, list[int]] = Field(default_factory=dict)
+    dependencies: dict[int, list[int]] | None = Field(default=None)
     step_statuses: dict[str, str] = Field(default_factory=dict)
     step_notes: dict[str, str] = Field(default_factory=dict)
     step_tool_calls: dict[str, list[dict]] = Field(default_factory=dict)
@@ -65,17 +65,21 @@ class PlanDocument(BaseModel):
                     self.step_statuses[si] = StepStatus.NOT_STARTED
         # 仅当 dependencies 未提供（None）时设为顺序依赖
         # 如果显式传了 {}（空 dict），表示各步骤间无依赖（DAG 并行）
-        if self.dependencies is None and len(self.steps) > 1:
-            self.dependencies = {i: [i - 1] for i in range(1, len(self.steps))}
+        if self.dependencies is None:
+            if len(self.steps) > 1:
+                self.dependencies = {i: [i - 1] for i in range(1, len(self.steps))}
+            else:
+                self.dependencies = {}
 
     def get_ready_steps(self) -> list[int]:
         """获取所有前置依赖已完成的步骤索引（DAG 依赖解析）。"""
         ready = []
+        dependencies = self.dependencies if self.dependencies is not None else {}
         for i in range(len(self.steps)):
             status = self.step_statuses.get(str(i), StepStatus.NOT_STARTED)
             if status != StepStatus.NOT_STARTED:
                 continue
-            deps = self.dependencies.get(i, [])
+            deps = dependencies.get(i, [])
             all_done = all(self.step_statuses.get(str(d), StepStatus.NOT_STARTED) == StepStatus.COMPLETED for d in deps)
             if all_done:
                 ready.append(i)
@@ -136,7 +140,7 @@ class PlanDocument(BaseModel):
                 StepStatus.COMPLETED: "✅",
                 StepStatus.BLOCKED: "⛔",
             }.get(self.step_statuses.get(str(i), StepStatus.NOT_STARTED), "⬜")
-            deps = self.dependencies.get(i, [])
+            deps = (self.dependencies if self.dependencies is not None else {}).get(i, [])
             dep_str = f" (depends on: {deps})" if deps else ""
             lines.append(f"Step{i}: {sym} {step}{dep_str}")
             if with_detail and self.step_notes.get(str(i)):

@@ -15,6 +15,10 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from dotenv import load_dotenv
+
+# 加载 .env（必须在任何 os.getenv 之前，且对所有入口生效）
+load_dotenv()
 
 
 # 环境变量引用：$VAR 会被替换为环境变量的值

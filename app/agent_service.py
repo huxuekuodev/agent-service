@@ -30,12 +30,33 @@ class AgentService:
     def __init__(self) -> None:
         self._app_config = get_app_config()
         self._checkpointer = create_checkpointer(self._app_config)
+        self._checkpointer_ctx = None
+        self._run_context: RunContext | None = None
+        self._agent: GraphAgent | None = None
+
+    async def __aenter__(self) -> "AgentService":
+        """进入生命周期：打开 postgres 连接池 + setup 建表（memory 直接可用）。"""
+        # postgres 模式返回 Handle（需 async with 进入）；memory 直接返回 saver
+        if hasattr(self._checkpointer, "__aenter__"):
+            self._checkpointer_ctx = self._checkpointer
+            saver = await self._checkpointer.__aenter__()
+        else:
+            saver = self._checkpointer
+
         self._run_context = RunContext(
-            checkpointer=self._checkpointer,
+            checkpointer=saver,
             app_config=self._app_config,
         )
         # 无状态图：全局单例，编译一次复用
         self._agent = GraphAgent(self._run_context)
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        """退出生命周期：释放 postgres 连接池。"""
+        if self._checkpointer_ctx is not None:
+            await self._checkpointer_ctx.__aexit__(*exc)
+            self._checkpointer_ctx = None
+        self._agent = None
 
     # ------------------------------------------------------------------
     # 会话管理
@@ -71,13 +92,23 @@ class AgentService:
     # 对话
     # ------------------------------------------------------------------
 
+    def _require_agent(self) -> GraphAgent:
+        """确保服务已进入生命周期（__aenter__ 初始化了 agent）。"""
+        if self._agent is None:
+            raise RuntimeError(
+                "AgentService 未初始化：请使用 `async with AgentService() as svc:` "
+                "进入生命周期后再调用对话接口。"
+            )
+        return self._agent
+
     async def chat(self, session_id: str, message: str) -> list[dict]:
         """发送消息并等待完整回复。"""
+        agent = self._require_agent()
         trace_id = trace_id_ctx_var.get() or uuid.uuid4().hex
         state = {"messages": [HumanMessage(content=message)]}
 
         chunks = []
-        async for st in self._agent.astream(
+        async for st in agent.astream(
             state,
             thread_id=session_id,
             trace_id=trace_id,
@@ -91,9 +122,10 @@ class AgentService:
         Yields:
             dict: {"type": "values"|"custom"|"messages", "data": ...}
         """
+        agent = self._require_agent()
         trace_id = trace_id_ctx_var.get() or uuid.uuid4().hex
         state = {"messages": [HumanMessage(content=message)]}
-        async for st in self._agent.astream(
+        async for st in agent.astream(
             state,
             thread_id=session_id,
             trace_id=trace_id,

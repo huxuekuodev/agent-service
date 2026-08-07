@@ -78,12 +78,12 @@ def ask_clarification_tool(
     return "Clarification request processed by middleware"
 
 
-def get_plan_tools(*, app_config: Any = None) -> list[BaseTool]:
+async def get_plan_tools(*, app_config: Any = None) -> list[BaseTool]:
     """获取 plan 阶段可用的工具（ask_clarification）。"""
     return [ask_clarification_tool]
 
 
-def get_execute_tools(*, app_config: Any = None) -> list[BaseTool]:
+async def get_execute_tools(*, app_config: Any = None) -> list[BaseTool]:
     """获取 execute 阶段可用的工具。
 
     独立服务版：从配置加载执行工具，默认空。
@@ -96,9 +96,9 @@ def get_execute_tools(*, app_config: Any = None) -> list[BaseTool]:
     return []
 
 
-def describe_execute_tools(*, app_config: Any = None) -> str:
+async def describe_execute_tools(*, app_config: Any = None) -> str:
     """生成执行能力描述，供规划节点参考。"""
-    tools = get_execute_tools(app_config=app_config)
+    tools = await get_execute_tools(app_config=app_config)
     if not tools:
         return ""
 
@@ -116,9 +116,9 @@ def describe_execute_tools(*, app_config: Any = None) -> str:
     return "\n".join(lines)
 
 
-def describe_execute_tools_v2(*, app_config: Any = None) -> str:
+async def describe_execute_tools_v2(*, app_config: Any = None) -> str:
     """生成执行能力描述（v2，供执行 agent 参考）。"""
-    tools = get_execute_tools(app_config=app_config)
+    tools = await get_execute_tools(app_config=app_config)
     if not tools:
         return ""
 

@@ -156,19 +156,34 @@ async def main():
 
     from app.core.checkpointer import create_checkpointer
 
-    # 独立服务：从 config.yaml 的 database 段创建共享 checkpointer
+    # 独立服务：从 config.yaml 的 database 段创建共享 checkpointer。
+    # postgres 模式返回 PostgresCheckpointerHandle，需 async with 进入
+    # （打开连接池 + setup 建表）；memory 模式直接返回 saver。
     checkpointer = create_checkpointer(app_config)
-    runcontext = RunContext(checkpointer=checkpointer, app_config=app_config)
-    # 无状态图：全局复用，thread_id 每次传入
-    agent = GraphAgent(runcontext)
-    userquery = "查询河北今天天气最凉爽的城市"
-    state = {"messages": [HumanMessage(content=userquery)]}
-    thread_id = "debug-thread-001"
 
-    # 使用成熟的消息打印器
-    printer = StreamPrinter()
-    async for chunk in agent.astream(state, thread_id=thread_id, trace_id=trace_id):
-        printer.handle_chunk(chunk)
+    # 用 async with 管理生命周期（兼容 Handle 和直接 saver）
+    enter_ctx = checkpointer if hasattr(checkpointer, "__aenter__") else None
+    saver = None
+    if enter_ctx:
+        saver = await enter_ctx.__aenter__()
+    else:
+        saver = checkpointer
+
+    try:
+        runcontext = RunContext(checkpointer=saver, app_config=app_config)
+        # 无状态图：全局复用，thread_id 每次传入
+        agent = GraphAgent(runcontext)
+        userquery = "查询河北今天天气最凉爽的城市"
+        state = {"messages": [HumanMessage(content=userquery)]}
+        thread_id = "debug-thread-001"
+
+        # 使用成熟的消息打印器
+        printer = StreamPrinter()
+        async for chunk in agent.astream(state, thread_id=thread_id, trace_id=trace_id):
+            printer.handle_chunk(chunk)
+    finally:
+        if enter_ctx:
+            await enter_ctx.__aexit__(None, None, None)
 
     # 提取最终答案
     final_ai = printer.final_answer

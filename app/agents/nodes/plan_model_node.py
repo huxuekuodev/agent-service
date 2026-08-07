@@ -14,6 +14,7 @@
   - 仅保留 ask_clarification 工具（经 get_plan_tools 注入）
 """
 
+import asyncio
 from typing import Any, cast
 
 from langchain.agents import create_agent
@@ -27,11 +28,7 @@ from pydantic import BaseModel, Field
 
 from app.agents.current_time import has_current_time_for_today
 from app.agents.errors import build_error_fallback_message, classify_llm_error
-from app.agents.evaluation.plan_evaluator import (
-    EvaluationInput,
-    PlanEvaluationConfig,
-    PlanEvaluator,
-)
+from app.agents.evaluation.plan_evaluator import EvaluationInput, PlanEvaluationConfig, PlanEvaluator
 from app.agents.lead_agent import GraphContext, create_llm_with_name
 from app.agents.middlewares.clarification_middleware import ClarificationMiddleware
 from app.agents.middlewares.dangling_tool_call_middleware import DanglingToolCallMiddleware
@@ -62,31 +59,14 @@ class PlanOutput(BaseModel):
     answer: str = Field(default="", description="action=complete 时的最终答案文本，其他情况为空字符串")
 
 
-def _build_system_prompt(agent_descriptions: str = "", capability_descriptions: str = "") -> str:
-    try:
-        langfuse = Langfuse()
-        return langfuse.get_prompt("deerflow_v2/plan_system_prompt_v2", type="text").compile(
+async def _build_system_prompt(agent_descriptions: str = "", capability_descriptions: str = "") -> str:
+    # Langfuse API 调用（网络 IO），异步
+    langfuse = Langfuse()
+    return await asyncio.to_thread(
+        lambda: langfuse.get_prompt("plan_node_system_prompt", type="text").compile(
             agent_descriptions=agent_descriptions or "- general_agent: 通用执行 agent，可调用所有工具",
             capability_descriptions=capability_descriptions or "",
         )
-    except Exception:
-        # Langfuse 未配置或 prompt 缺失时，回退到本地提示词
-        return _load_local_prompt("plan_system_prompt_v2.md", agent_descriptions, capability_descriptions)
-
-
-def _load_local_prompt(filename: str, agent_descriptions: str, capability_descriptions: str) -> str:
-    """从 app/prompts/ 读取本地提示词 md，替换占位符。"""
-    from pathlib import Path
-
-    prompt_dir = Path(__file__).resolve().parent.parent.parent / "prompts"
-    path = prompt_dir / filename
-    if path.exists():
-        content = path.read_text(encoding="utf-8")
-        return content.replace("{{agent_descriptions}}", agent_descriptions or "").replace("{{capability_descriptions}}", capability_descriptions or "")
-    # 极简兜底
-    return ("你是任务规划节点。\n可用 agent:\n{agent_descriptions}\n执行工具:\n{capability_descriptions}\n请将用户需求拆解为原子任务，输出 JSON。").format(
-        agent_descriptions=agent_descriptions or "",
-        capability_descriptions=capability_descriptions or "",
     )
 
 
@@ -116,7 +96,7 @@ async def plan_model_node(state: ThreadState, config: RunnableConfig, runtime: R
     # 构建 system prompt
     from app.agents.tools import describe_execute_tools, get_plan_tools
 
-    capability_desc = describe_execute_tools()
+    capability_desc = await describe_execute_tools()
 
     plan_context = ""
     if existing_tasks:
@@ -147,7 +127,7 @@ async def plan_model_node(state: ThreadState, config: RunnableConfig, runtime: R
     )
 
     # 绑定工具：仅 ask_clarification（get_plan_tools 已包含）。
-    plan_tools = get_plan_tools()
+    plan_tools = await get_plan_tools()
     agent = create_agent(
         create_llm_with_name(config, model_name="plan_node_model"),
         plan_tools,
@@ -159,7 +139,7 @@ async def plan_model_node(state: ThreadState, config: RunnableConfig, runtime: R
         ],
         name="plan_node_agent",
         response_format=PlanOutput,
-        system_prompt=_build_system_prompt(capability_descriptions=capability_desc),
+        system_prompt=await _build_system_prompt(capability_descriptions=capability_desc),
     )
 
     # 规划节点重试机制：由 LangGraph 的 retry_policy（见 lead_agent/agent.py）接管。

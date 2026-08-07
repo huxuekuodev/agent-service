@@ -21,11 +21,7 @@ from langgraph.types import RetryPolicy
 
 from app.agents.errors import should_retry
 from app.agents.lead_agent import GraphContext, create_llm
-from app.agents.nodes import (
-    plan_model_node,
-    step_dispatch_node,
-    step_fan_out_router,
-)
+from app.agents.nodes import plan_model_node, step_dispatch_node, step_fan_out_router
 from app.agents.plan_storage import get_plan_storage
 from app.agents.subagent.general_agent import general_agent
 from app.agents.thread_state import ThreadState
@@ -58,7 +54,7 @@ class GraphAgent:
     def _build_graph(self) -> Any:
         if self._agent is not None:
             return self._agent
-        builder = StateGraph(ThreadState, context_schema=GraphContext)
+        builder = StateGraph(ThreadState, context_schema=GraphContext)  # type: ignore
 
         builder.add_node("plan_model_node", cast(Any, plan_model_node), retry_policy=_PLAN_RETRY_POLICY)
         builder.add_node("step_dispatch_node", cast(Any, step_dispatch_node))

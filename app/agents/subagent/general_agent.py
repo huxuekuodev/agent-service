@@ -8,6 +8,8 @@
   4. 修改任务状态为 completed，写入 result
 """
 
+import asyncio
+
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
@@ -50,14 +52,14 @@ async def general_agent(state: ThreadState, config: RunnableConfig, runtime: Run
 
     # === 2. 调用 LLM 执行任务 ===
     langfuse_client = runtime.context.langfuse_client
-    tools_desc = describe_execute_tools_v2()
+    tools_desc = await describe_execute_tools_v2()
     if langfuse_client is not None:
         try:
-            system_prompt = langfuse_client.get_prompt("deerflow_v2/general_agent_system_prompt").compile(tools_desc=tools_desc)
+            system_prompt = langfuse_client.get_prompt("general_agent_system_prompt").compile(tools_desc=tools_desc)
         except Exception:
-            system_prompt = _load_local_general_prompt(tools_desc)
+            system_prompt = await _load_local_general_prompt(tools_desc)
     else:
-        system_prompt = _load_local_general_prompt(tools_desc)
+        system_prompt = await _load_local_general_prompt(tools_desc)
     task_info = f"""任务名称：{task_name}
                         任务描述：{task_desc}
                         计划 ID：{plan_id}
@@ -65,7 +67,7 @@ async def general_agent(state: ThreadState, config: RunnableConfig, runtime: Run
 
     llm = create_llm_with_name(config, model_name="general_node_model")
     # create_agent 的 tools 参数会在内部自动 bind_tools，无需手动绑定
-    agent = create_agent(model=llm, tools=get_execute_tools(), system_prompt=system_prompt, name="general_node_agent")
+    agent = create_agent(model=llm, tools=await get_execute_tools(), system_prompt=system_prompt, name="general_node_agent")
     agent_result = await agent.ainvoke(
         {"messages": [HumanMessage(content=task_info)]},
         config=config,
@@ -88,13 +90,19 @@ def _get_deps_of(plan_id: str, plan_tasks: list[SubTask]) -> list[str]:
     return task.deps if task else []
 
 
-def _load_local_general_prompt(tools_desc: str) -> str:
-    """从 app/prompts/ 读取通用执行节点提示词，替换 tools_desc 占位符。"""
+async def _load_local_general_prompt(tools_desc: str) -> str:
+    """从 app/prompts/ 读取通用执行节点提示词，替换 tools_desc 占位符（异步读文件）。"""
     from pathlib import Path
 
-    prompt_dir = Path(__file__).resolve().parent.parent.parent.parent / "prompts"
-    path = prompt_dir / "general_agent_system_prompt.md"
-    if path.exists():
-        content = path.read_text(encoding="utf-8")
+    async def _read() -> str:
+        prompt_dir = Path(__file__).resolve().parent.parent.parent.parent / "prompts"
+        path = prompt_dir / "general_agent_system_prompt.md"
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        return ""
+
+    content = await asyncio.to_thread(_read)
+    if content:
+        # pyrefly: ignore [missing-attribute]
         return content.replace("{{tools_desc}}", tools_desc or "")
     return ("你是通用执行节点，负责完成分配的任务。\n可用工具:\n{tools_desc}\n请执行任务并返回结果。").format(tools_desc=tools_desc or "")

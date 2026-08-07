@@ -21,13 +21,18 @@ from app.core.log import logger
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 
 # 全局服务实例（由 main.py 注入或单例）
-_service: AgentService | None = None
-
-
 def get_service() -> AgentService:
-    global _service
+    """获取全局 AgentService（生命周期由 main.py 的 startup/shutdown 管理）。
+
+    若未初始化（直接调用 router 而非通过 main 启动），则自动创建（memory 模式可用）。
+    """
+    from app.main import _service
+
     if _service is None:
-        _service = AgentService()
+        raise RuntimeError(
+            "AgentService 未初始化：请通过 FastAPI app 启动（uvicorn app.main:app），"
+            "startup 事件会创建并进入 service 生命周期。"
+        )
     return _service
 
 
