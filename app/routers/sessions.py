@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -20,20 +20,21 @@ from app.core.log import logger
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 
-# 全局服务实例（由 main.py 注入或单例）
-def get_service() -> AgentService:
-    """获取全局 AgentService（生命周期由 main.py 的 startup/shutdown 管理）。
 
-    若未初始化（直接调用 router 而非通过 main 启动），则自动创建（memory 模式可用）。
+def get_service(request: Request) -> AgentService:
+    """从 app.state 获取 AgentService（由 lifespan 注入）。
+
+    生命周期由 FastAPI lifespan 管理：
+      - startup 时创建并进入（打开连接池 + 建表）
+      - shutdown 时释放
     """
-    from app.main import _service
-
-    if _service is None:
+    service = getattr(request.app.state, "agent_service", None)
+    if service is None:
         raise RuntimeError(
             "AgentService 未初始化：请通过 FastAPI app 启动（uvicorn app.main:app），"
-            "startup 事件会创建并进入 service 生命周期。"
+            "lifespan 会创建并注入 app.state.agent_service。"
         )
-    return _service
+    return service
 
 
 class CreateSessionRequest(BaseModel):
@@ -51,34 +52,30 @@ class ChatRequest(BaseModel):
 
 
 @router.post("", response_model=CreateSessionResponse)
-async def create_session(req: CreateSessionRequest) -> CreateSessionResponse:
+async def create_session(req: CreateSessionRequest, svc: AgentService = Depends(get_service)) -> CreateSessionResponse:
     """创建新会话。"""
-    svc = get_service()
     result = svc.create_session(model_name=req.model_name)
     logger.info("创建会话: {}", result["session_id"])
     return CreateSessionResponse(**result)
 
 
 @router.get("")
-async def list_sessions() -> dict:
+async def list_sessions(svc: AgentService = Depends(get_service)) -> dict:
     """列出所有活跃会话。"""
-    svc = get_service()
     return {"sessions": svc.list_sessions()}
 
 
 @router.delete("/{session_id}")
-async def delete_session(session_id: str) -> dict:
+async def delete_session(session_id: str, svc: AgentService = Depends(get_service)) -> dict:
     """删除会话。"""
-    svc = get_service()
     if not svc.delete_session(session_id):
         raise HTTPException(status_code=404, detail="Session not found")
     return {"success": True, "session_id": session_id}
 
 
 @router.post("/{session_id}/chat/sync")
-async def chat_sync(session_id: str, req: ChatRequest) -> dict:
+async def chat_sync(session_id: str, req: ChatRequest, svc: AgentService = Depends(get_service)) -> dict:
     """发送消息，等待完整回复。"""
-    svc = get_service()
     try:
         messages = await svc.chat(session_id, req.message)
     except ValueError as e:
@@ -87,7 +84,7 @@ async def chat_sync(session_id: str, req: ChatRequest) -> dict:
 
 
 @router.post("/{session_id}/chat")
-async def chat_stream(session_id: str, req: ChatRequest) -> StreamingResponse:
+async def chat_stream(session_id: str, req: ChatRequest, svc: AgentService = Depends(get_service)) -> StreamingResponse:
     """发送消息，SSE 流式返回。
 
     Yields:
@@ -95,7 +92,6 @@ async def chat_stream(session_id: str, req: ChatRequest) -> StreamingResponse:
         - values: 完整 state 快照（含新消息）
         - end: 结束
     """
-    svc = get_service()
 
     async def event_gen():
         try:

@@ -34,7 +34,7 @@ class AgentService:
         self._run_context: RunContext | None = None
         self._agent: GraphAgent | None = None
 
-    async def __aenter__(self) -> "AgentService":
+    async def __aenter__(self) -> AgentService:
         """进入生命周期：打开 postgres 连接池 + setup 建表（memory 直接可用）。"""
         # postgres 模式返回 Handle（需 async with 进入）；memory 直接返回 saver
         if hasattr(self._checkpointer, "__aenter__"):

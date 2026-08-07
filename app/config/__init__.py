@@ -68,7 +68,7 @@ class ModelConfig:
     max_retries: int | None = None
 
     @classmethod
-    def from_dict(cls, d: dict) -> "ModelConfig":
+    def from_dict(cls, d: dict) -> ModelConfig:
         return cls(
             name=_resolve_env(d.get("name", "default")) or "default",
             use=_resolve_env(d.get("use", "langchain_openai:ChatOpenAI")) or "langchain_openai:ChatOpenAI",
@@ -100,7 +100,7 @@ class PlanEvaluationSettings:
     )
 
     @classmethod
-    def from_dict(cls, d: dict | None) -> "PlanEvaluationSettings":
+    def from_dict(cls, d: dict | None) -> PlanEvaluationSettings:
         d = d or {}
         return cls(
             enabled=bool(d.get("enabled", False)),
@@ -111,13 +111,69 @@ class PlanEvaluationSettings:
 
 
 @dataclass
+class EvaluatorSettings:
+    """评估器配置（config.yaml 的 ``evaluators`` 列表项）。
+
+    字段语义与 ``models`` 列表项对齐：
+      - ``name``: 评估器唯一名（registry 里按此注册，节点通过名字取用）。
+      - ``display_name``: 展示名（Langfuse observation 名默认用它）。
+      - ``use``: BaseEvaluator 子类的 import 路径，如 ``app.agents.evaluation.plan_evaluator:PlanEvaluator``。
+      - ``model``: 评估 LLM 在 ``models`` 列表里的 name；省略时用默认模型。
+      - ``system_prompt``: 评估 LLM 的系统提示词（可定制）。
+      - ``enabled``: 总开关。
+      - ``sample_rate``: 采样率 0-1。
+      - ``metrics``: 按指标名覆盖 ``{name: {enabled/pass_score/label/description}}``。
+      - ``extra``: 传给子类 __init__ 的额外关键字参数（任意子类定制字段）。
+    """
+
+    name: str
+    display_name: str = ""
+    use: str = ""
+    model: str | None = None
+    system_prompt: str | None = None
+    enabled: bool = True
+    sample_rate: float = 1.0
+    metrics: dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> EvaluatorSettings:
+        d = d or {}
+        extra = dict(d.get("extra") or {})
+        return cls(
+            name=str(d.get("name", "")),
+            display_name=str(d.get("display_name", "")),
+            use=str(d.get("use", "")),
+            model=_resolve_env(d.get("model")),
+            system_prompt=d.get("system_prompt"),
+            enabled=bool(d.get("enabled", True)),
+            sample_rate=float(d.get("sample_rate", 1.0)),
+            metrics=dict(d.get("metrics") or {}),
+            extra=extra,
+        )
+
+    def as_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "display_name": self.display_name,
+            "use": self.use,
+            "model": self.model,
+            "system_prompt": self.system_prompt,
+            "enabled": self.enabled,
+            "sample_rate": self.sample_rate,
+            "metrics": self.metrics,
+            "extra": self.extra,
+        }
+
+
+@dataclass
 class SubagentsSettings:
     """执行 agent 配置（兼容 agentsv2 的 custom_agents）。"""
 
     custom_agents: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_dict(cls, d: dict | None) -> "SubagentsSettings":
+    def from_dict(cls, d: dict | None) -> SubagentsSettings:
         d = d or {}
         return cls(custom_agents=d.get("custom_agents") or {})
 
@@ -132,7 +188,7 @@ class LangfuseConfig:
     host: str = "https://cloud.langfuse.com"
 
     @classmethod
-    def from_dict(cls, d: dict | None) -> "LangfuseConfig":
+    def from_dict(cls, d: dict | None) -> LangfuseConfig:
         d = d or {}
         return cls(
             enabled=bool(d.get("enabled", False)),
@@ -150,7 +206,7 @@ class LoggingConfig:
     file: str | None = None
 
     @classmethod
-    def from_dict(cls, d: dict | None) -> "LoggingConfig":
+    def from_dict(cls, d: dict | None) -> LoggingConfig:
         d = d or {}
         level = str(d.get("level", "INFO")).upper()
         file = d.get("file")
@@ -167,7 +223,7 @@ class DatabaseConfig:
     """PostgreSQL 连接 URL，如 postgresql://user:pass@host:5432/db。"""
 
     @classmethod
-    def from_dict(cls, d: dict | None) -> "DatabaseConfig":
+    def from_dict(cls, d: dict | None) -> DatabaseConfig:
         d = d or {}
         return cls(
             backend=str(d.get("backend", "memory")),
@@ -188,8 +244,11 @@ class AppConfig:
 
     langfuse: LangfuseConfig = field(default_factory=LangfuseConfig)
 
-    # 规划评估（LLM-as-Judge）
+    # 规划评估（LLM-as-Judge，旧配置，向后兼容）
     plan_evaluation: PlanEvaluationSettings = field(default_factory=PlanEvaluationSettings)
+
+    # 评估器列表（推荐方式，见 EvaluatorSettings）
+    evaluators: list[EvaluatorSettings] = field(default_factory=list)
 
     # 执行 agent 配置
     subagents: SubagentsSettings = field(default_factory=SubagentsSettings)
@@ -199,7 +258,7 @@ class AppConfig:
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
 
     @classmethod
-    def from_file(cls, path: str | None = None) -> "AppConfig":
+    def from_file(cls, path: str | None = None) -> AppConfig:
         """从 YAML 文件加载配置。"""
         config_path = Path(path) if path else _find_config_file()
         if config_path is None:
@@ -211,7 +270,7 @@ class AppConfig:
         return cls.from_dict(data)
 
     @classmethod
-    def from_dict(cls, data: dict) -> "AppConfig":
+    def from_dict(cls, data: dict) -> AppConfig:
         models = [ModelConfig.from_dict(m) for m in data.get("models") or []]
         return cls(
             config_version=int(data.get("config_version", 1)),
@@ -220,6 +279,7 @@ class AppConfig:
             models=models,
             langfuse=LangfuseConfig.from_dict(data.get("langfuse")),
             plan_evaluation=PlanEvaluationSettings.from_dict(data.get("plan_evaluation")),
+            evaluators=[EvaluatorSettings.from_dict(e) for e in data.get("evaluators") or []],
             subagents=SubagentsSettings.from_dict(data.get("subagents")),
             storage_dir=str(data.get("storage_dir", ".deer-agent")),
             database=DatabaseConfig.from_dict(data.get("database")),
@@ -229,6 +289,13 @@ class AppConfig:
         for m in self.models:
             if m.name == name:
                 return m
+        return None
+
+    def get_evaluator(self, name: str) -> EvaluatorSettings | None:
+        """按名字取评估器配置。"""
+        for e in self.evaluators:
+            if e.name == name:
+                return e
         return None
 
     @property

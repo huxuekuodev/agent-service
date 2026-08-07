@@ -58,7 +58,7 @@ langfuse:
   secret_key:
   host: https://cloud.langfuse.com
 
-# 规划评估（LLM-as-Judge）
+# 规划评估（LLM-as-Judge，旧配置，向后兼容）
 plan_evaluation:
   enabled: false
   sample_rate: 1.0
@@ -67,6 +67,33 @@ plan_evaluation:
     clarification_quality: true
     task_atomicity: true
     agent_selection_validity: true
+
+# 评估器列表（推荐方式；每个评估器 = 一个 BaseEvaluator 子类实例）
+#   use: 子类 import 路径；model: models 列表里的 name；enabled: 总开关；
+#   metrics: 按指标名覆盖 {enabled / pass_score / label / description}。
+evaluators:
+  - name: plan_evaluation
+    display_name: "规划评估"
+    use: app.agents.evaluation.plan_evaluator:PlanEvaluator
+    model: evaluate_model
+    system_prompt: |
+      你是规划质量评估器。评估规划 agent 的决策质量，输出严格 JSON。
+      规划 agent 可能的三种输出：
+      1. 调用了 ask_clarification（clarification_requested=true）：需求含糊时澄清，是正确行为。
+      2. 输出计划（tasks 非空）：需求清晰时拆解为原子任务。
+      3. 直接回复（既未澄清也未产出计划）：若需求可执行却直接放弃，则是失败场景。
+    enabled: true
+    sample_rate: 1.0
+    metrics:
+      clarification_quality:
+        enabled: true
+        pass_score: 0.8
+      task_atomicity:
+        enabled: true
+        pass_score: 0.8
+      agent_selection_validity:
+        enabled: true
+        pass_score: 0.8
 
 # 执行 agent 配置
 subagents:

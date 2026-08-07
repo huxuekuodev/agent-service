@@ -3,9 +3,9 @@ import logging
 from langchain_core.runnables import RunnableConfig
 from langfuse import Langfuse
 
-from app.config.agents import load_agent_config, validate_agent_name
-from app.config import AppConfig, get_app_config
 from app.agents.models import create_chat_model
+from app.config import AppConfig, get_app_config
+from app.config.agents import load_agent_config, validate_agent_name
 
 logger = logging.getLogger(__name__)
 langfuse_client = Langfuse()
