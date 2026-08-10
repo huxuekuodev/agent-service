@@ -150,8 +150,7 @@ async def plan_model_node(state: ThreadState, config: RunnableConfig, runtime: R
         # cast: create_agent 的输入类型是 _InputAgentState，实际传入 dict[str, list[BaseMessage]]
         # 是 langchain 标准用法，运行时安全；cast 消除静态类型噪音。
         agent_output = await agent.ainvoke(cast(Any, {"messages": messages}), config=config)
-        agent_msgs: list[Any] = agent_output.get("messages", []) if isinstance(agent_output, dict) else []
-
+        agent_msgs: list[BaseMessage] = agent_output.get("messages", []) if isinstance(agent_output, dict) else []
         # 判定 agent 的实际输出类型（不管进哪个分支，都先评估）。
         # 注意：agent_output["messages"] 包含历史 + 本轮新增，若遍历全部，
         # 历史中曾出现过的 ask_clarification 调用会让 has_clarification 永远为 True
@@ -183,7 +182,8 @@ async def plan_model_node(state: ThreadState, config: RunnableConfig, runtime: R
         if plan_output and plan_output.action == "complete" and plan_output.answer:
             answer_msg = AIMessage(content=plan_output.answer)
             writer({"type": THINK_MES, "messages": "📋 反思通过，生成最终答案", "trace_id": trace_id})
-            return {"messages": [answer_msg], "completed": True}
+            # 反思通过后，清空旧计划（若有）。
+            return {"messages": [answer_msg], "completed": True, "plan_tasks": Overwrite(value=[])}
 
         # 规划：模型输出了有效计划
         if plan_output and plan_output.tasks:

@@ -16,6 +16,8 @@ from typing import Any, cast
 
 from langchain_core.runnables import RunnableConfig
 from langfuse import Langfuse
+from langfuse.langchain import CallbackHandler
+from langfuse.types import TraceContext
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import RetryPolicy
 
@@ -127,6 +129,7 @@ class GraphAgent:
         if trace_id:
             configurable["trace_id"] = trace_id
         config: RunnableConfig = {"configurable": configurable}
+        config["callbacks"] = [CallbackHandler(trace_context=TraceContext(trace_id=trace_id or ""))]
 
         async for st in agent.astream(
             stream_mode=["values", "messages", "custom"],
