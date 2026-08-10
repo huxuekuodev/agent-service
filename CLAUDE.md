@@ -57,7 +57,12 @@ agent-service/
     │   ├── plan_document.py  # Plan DAG 数据模型（v1 遗留，StepStatus 等）
     │   ├── plan_storage.py   # Plan 存储抽象（内存/Redis 后端，v1 遗留）
     │   ├── plan_toolkit.py   # Plan 工具集 v2：create/update/get_plan_status（ContextVar 桥接）
-    │   ├── tools.py          # 工具注册表：ask_clarification、plan/execute 工具加载
+    │   ├── tools/            # 工具注册表（包）：按业务分类组织第三方工具
+    │   │   ├── __init__.py   # 对外 API：get_plan_tools / get_execute_tools / describe_execute_tools
+    │   │   ├── registry.py   # 从 config `tools` 段加载工具类，按 allowed_agents 过滤
+    │   │   ├── builtin.py    # 内置工具：ask_clarification（澄清）
+    │   │   ├── web/          # 联网类工具（web_search，基于 Tavily API）
+    │   │   └── knowledge/    # 知识库类工具（internal_kb 私有知识库示例）
     │   ├── errors.py         # 规划节点 LLM 错误分类（可重试 vs 不可恢复）
     │   ├── current_time.py   # <current_time> 注入辅助（避免重复注入，可单测）
     │   ├── lead_agent/
@@ -94,6 +99,8 @@ agent-service/
 ## 项目规则
 - 当创建新的配置项时，确保`config.yaml` 和 `config.example.yaml` 都有对应的更新。
 - 编写所有的类与函数都要使用 `asyncio` 异步化，避免阻塞主线程 和 类型提示。
+- 修复问题是不应该已越狱的方式，而是应该直面问题找到生产级的解决方案。
+- **不要动宿主机的 venv / 解释器 / 依赖环境**：`.venv`、`uv sync`、`pip install`、重建软链接等环境级操作只在宿主机（macOS 终端）执行；沙箱（Linux VM）内禁止环境重建，只做只读诊断，修复指令交给用户。
 
 ## 测试指令
 - 写完代码后，运行 `uv run ruff check` 与 `uv run ruff format --check` 检查 lint / 格式。

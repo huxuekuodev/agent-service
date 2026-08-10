@@ -45,10 +45,12 @@ async def general_agent(state: ThreadState, config: RunnableConfig, runtime: Run
         return {"completed": True}
 
     # === 1. 验证依赖任务是否已完成 ===
+    deps_results: str = ""
     for dep_id in _get_deps_of(plan_id, plan_tasks):
         dep_task = _find_task(dep_id, plan_tasks)
         if dep_task is None or dep_task.step_statuses != "completed":
             return {"plan_tasks": [SubTask(plan_id=plan_id, step_statuses="not_started", blocked_message=f"依赖任务 [{dep_id}] 尚未完成")]}
+        deps_results += f"{dep_id}: {dep_task.result}\n"
 
     # === 2. 调用 LLM 执行任务 ===
     langfuse_client = runtime.context.langfuse_client
@@ -60,9 +62,10 @@ async def general_agent(state: ThreadState, config: RunnableConfig, runtime: Run
             system_prompt = await _load_local_general_prompt(tools_desc)
     else:
         system_prompt = await _load_local_general_prompt(tools_desc)
-    task_info = f"""任务名称：{task_name}
-                        任务描述：{task_desc}
-                        计划 ID：{plan_id}
+    task_info = f"""任务名称：{task_name}\n
+                        任务描述：{task_desc}\n
+                        计划 ID：{plan_id}\n
+                        依赖任务结果：{deps_results}\n
                         <current_time>{runtime.context.current_time}</current_time>"""
 
     llm = create_llm_with_name(config, model_name="general_node_model")

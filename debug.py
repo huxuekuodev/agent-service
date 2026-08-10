@@ -173,7 +173,7 @@ async def main():
         runcontext = RunContext(checkpointer=saver, app_config=app_config)
         # 无状态图：全局复用，thread_id 每次传入
         agent = GraphAgent(runcontext)
-        userquery = "查询河北今天天气最凉爽的城市"
+        userquery = "查询福建今天天气最凉爽的城市"
         state = {"messages": [HumanMessage(content=userquery)]}
         thread_id = "debug-thread-001"
 

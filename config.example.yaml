@@ -99,6 +99,36 @@ evaluators:
 subagents:
   custom_agents: {}
 
+# 第三方工具配置（供 agent 使用，按业务二分类组织）
+#   name: 工具名（agent 看到的工具名）
+#   use: 工具可导入路径，可指向：
+#     1) 已实例化的 BaseTool 对象（如 @tool 装饰的函数）；
+#     2) 工具工厂函数（接收 extra 关键字参数，返回 BaseTool）；
+#     3) BaseTool 子类（用 extra 实例化）。
+#   category: 业务分类（web / knowledge / ...），仅用于组织代码
+#   allowed_agents: 可用 agent 列表；为空表示所有 agent 可用
+#   enabled: 总开关
+#   extra: 透传给工具工厂/类的额外参数（API Key、endpoint 等，支持 $ENV 引用）
+tools:
+  - name: web_search
+    display_name: 联网搜索
+    use: app.agents.tools.web.web_search:make_web_search_tool
+    category: web
+    allowed_agents: [general_agent]
+    enabled: true
+    extra:
+      api_key: $TAVILY_API_KEY
+  - name: internal_kb
+    display_name: 私有知识库
+    use: app.agents.tools.knowledge.internal_kb:make_internal_kb_tool
+    category: knowledge
+    allowed_agents: [general_agent]
+    enabled: false  # 需配置 extra.endpoint / extra.api_key 后开启
+    extra:
+      endpoint: $KB_ENDPOINT
+      api_key: $KB_API_KEY
+
+
 # 数据存储
 storage_dir: .deer-agent
 

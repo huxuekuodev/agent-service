@@ -179,6 +179,46 @@ class SubagentsSettings:
 
 
 @dataclass
+class ToolConfig:
+    """第三方工具配置（config.yaml 的 ``tools`` 列表项）。
+
+    字段语义：
+      - ``name``: 工具唯一名（即 agent 看到的工具名）。
+      - ``use``: 工具的可导入路径，可指向：
+          1) 已实例化的 BaseTool 对象（如 ``@tool`` 装饰的函数）；
+          2) 工具工厂函数（接收 ``extra`` 关键字参数，返回 BaseTool）；
+          3) BaseTool 子类（用 ``extra`` 实例化）。
+      - ``category``: 业务分类（web / knowledge / ...），仅用于组织代码。
+      - ``allowed_agents``: 可用 agent 名列表；为空表示所有 agent 可用。
+      - ``enabled``: 总开关。
+      - ``extra``: 透传给工具工厂/类的额外参数（API Key、endpoint 等）。
+    """
+
+    name: str
+    display_name: str = ""
+    use: str = ""
+    category: str = "general"
+    allowed_agents: list[str] = field(default_factory=list)
+    enabled: bool = True
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> ToolConfig:
+        d = d or {}
+        extra = dict(d.get("extra") or {})
+        extra = {k: _resolve_env(v) for k, v in extra.items()}
+        return cls(
+            name=str(d.get("name", "")),
+            display_name=str(d.get("display_name", "")),
+            use=str(d.get("use", "")),
+            category=str(d.get("category", "general")),
+            allowed_agents=list(d.get("allowed_agents") or []),
+            enabled=bool(d.get("enabled", True)),
+            extra=extra,
+        )
+
+
+@dataclass
 class LangfuseConfig:
     """Langfuse 配置。"""
 
@@ -253,6 +293,9 @@ class AppConfig:
     # 执行 agent 配置
     subagents: SubagentsSettings = field(default_factory=SubagentsSettings)
 
+    # 第三方工具配置（供 agent 使用，按业务二分类组织）
+    tools: list[ToolConfig] = field(default_factory=list)
+
     # 数据存储（会话/线程持久化）
     storage_dir: str = ".deer-agent"
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
@@ -281,6 +324,7 @@ class AppConfig:
             plan_evaluation=PlanEvaluationSettings.from_dict(data.get("plan_evaluation")),
             evaluators=[EvaluatorSettings.from_dict(e) for e in data.get("evaluators") or []],
             subagents=SubagentsSettings.from_dict(data.get("subagents")),
+            tools=[ToolConfig.from_dict(t) for t in data.get("tools") or []],
             storage_dir=str(data.get("storage_dir", ".deer-agent")),
             database=DatabaseConfig.from_dict(data.get("database")),
         )
