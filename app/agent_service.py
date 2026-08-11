@@ -19,6 +19,55 @@ from app.core.checkpointer import create_checkpointer
 from app.core.context import trace_id_ctx_var
 from app.core.runtime import RunContext
 
+# LangGraph 多流模式 + subgraphs 的流协议常量
+_StreamModes = ("values", "messages", "custom", "updates", "debug")
+
+
+def _normalize_stream_event(chunk: Any) -> dict | None:
+    """将 LangGraph ``astream`` 的原始输出归一化为统一事件。
+
+    LangGraph 1.2.10（v2 协议，``stream_mode=[...]`` + ``subgraphs=True``）
+    的产出是 **StreamPart dict**（见 ``langgraph/types.py``）::
+
+        {"type": "messages"|"values"|"custom", "ns": [...], "data": ..., "interrupts": ...}
+
+    其中 ``data``:
+      - ``messages``: ``(msg_chunk, metadata)`` 二元组
+      - ``custom``: 传给 ``StreamWriter`` 的任意业务 dict（如 thinkMessage）
+      - ``values``: 完整状态 dict
+
+    同时兼容旧版元组形态 ``(mode, payload)`` / ``(namespace, (mode, payload))``。
+
+    归一化结果::
+
+        {"type": "values"|"messages"|"custom", "data": ...}
+
+    无法识别时返回 ``None``（由调用方跳过）。
+    """
+    # 旧版子图元组形态: (namespace, (mode, payload)) — 取内层 (mode, payload)
+    if isinstance(chunk, (tuple, list)) and len(chunk) == 2 and isinstance(chunk[0], (tuple, list)):
+        inner = chunk[1]
+        if isinstance(inner, (tuple, list)) and len(inner) == 2:
+            chunk = inner
+        else:
+            return None
+
+    # 新版 StreamPart dict: {type, ns, data, interrupts}
+    if isinstance(chunk, dict) and chunk.get("type") in _StreamModes and "data" in chunk:
+        return {"type": chunk["type"], "data": chunk.get("data")}
+
+    # 旧版元组形态: (mode, payload)
+    if isinstance(chunk, (tuple, list)) and len(chunk) == 2:
+        mode, payload = chunk
+        if mode in _StreamModes:
+            return {"type": mode, "data": payload}
+
+    # 兜底 dict 形态（单 stream_mode 或兼容情况）
+    if isinstance(chunk, dict):
+        return {"type": chunk.get("type", "values"), "data": chunk}
+
+    return None
+
 
 class AgentService:
     """Agent 服务。
@@ -102,25 +151,36 @@ class AgentService:
         return self._agent
 
     async def chat(self, session_id: str, message: str) -> list[dict]:
-        """发送消息并等待完整回复。"""
-        agent = self._require_agent()
-        trace_id = trace_id_ctx_var.get() or uuid.uuid4().hex
-        state = {"messages": [HumanMessage(content=message)]}
-
-        chunks = []
-        async for st in agent.astream(
-            state,
-            thread_id=session_id,
-            trace_id=trace_id,
-        ):
-            chunks.append(st)
-        return self._extract_messages(chunks)
+        """发送消息并等待完整回复（返回消息字典列表）。"""
+        self._require_agent()
+        messages: list[dict] = []
+        async for event in self.stream(session_id, message):
+            if event["type"] == "values":
+                data = event.get("data", {})
+                msgs = data.get("messages", []) if isinstance(data, dict) else []
+                for m in msgs:
+                    content = getattr(m, "content", "")
+                    if isinstance(content, str) and content.strip():
+                        messages.append(
+                            {
+                                "type": type(m).__name__,
+                                "content": content,
+                                "name": getattr(m, "name", None),
+                            }
+                        )
+            elif event["type"] == "custom":
+                messages.append({"type": "custom", "data": event.get("data")})
+        return messages
 
     async def stream(self, session_id: str, message: str):
         """发送消息并流式返回事件。
 
-        Yields:
-            dict: {"type": "values"|"custom"|"messages", "data": ...}
+        将 LangGraph 的原始流（``(mode, payload)`` / ``(namespace, (mode, payload))``
+        元组，见 ``agent.astream(stream_mode=[...], subgraphs=True)``）归一化为统一事件::
+
+            {"type": "values" | "messages" | "custom", "data": ...}
+
+        ``messages`` 事件为增量 token，供前端流式渲染。
         """
         agent = self._require_agent()
         trace_id = trace_id_ctx_var.get() or uuid.uuid4().hex
@@ -130,20 +190,26 @@ class AgentService:
             thread_id=session_id,
             trace_id=trace_id,
         ):
-            yield st
+            event = _normalize_stream_event(st)
+            if event is not None:
+                yield event
 
     # ------------------------------------------------------------------
     # 内部
     # ------------------------------------------------------------------
 
-    def _extract_messages(self, chunks: list[dict]) -> list[dict]:
-        """从 astream 输出中提取最终消息列表。"""
+    def _extract_messages(self, chunks: list) -> list[dict]:
+        """从原始流 chunk 中提取最终消息列表。
+
+        ``chunks`` 为 ``astream`` 原始输出（元组或 dict），见 :func:`_normalize_stream_event`。
+        """
         messages: list[dict] = []
         for chunk in chunks:
-            if not isinstance(chunk, dict):
+            event = _normalize_stream_event(chunk)
+            if event is None:
                 continue
-            ctype = chunk.get("type")
-            data = chunk.get("data", chunk)
+            ctype = event["type"]
+            data = event.get("data", {})
             if ctype == "values" and isinstance(data, dict):
                 msgs = data.get("messages", [])
                 for m in msgs:

@@ -185,7 +185,7 @@ async def plan_model_node(state: ThreadState, config: RunnableConfig, runtime: R
             # 反思通过后，清空旧计划（若有）。
             return {"messages": [answer_msg], "completed": True, "plan_tasks": Overwrite(value=[])}
 
-        # 规划：模型输出了有效计划
+        # 规划：模型输出了有效计划（有子任务）
         if plan_output and plan_output.tasks:
             subtasks = [_to_subtask(t) for t in plan_output.tasks]
             writer(
@@ -203,6 +203,15 @@ async def plan_model_node(state: ThreadState, config: RunnableConfig, runtime: R
                 return {"messages": agent_msgs, "plan_tasks": Overwrite(value=subtasks)}
             # action=update：合并到现有计划，保留旧任务
             return {"messages": agent_msgs, "plan_tasks": subtasks}
+
+        # 模型直接给出了最终答案（answer 非空）但没有子任务：
+        # 模型可能输出 action=create/update（未遵守「直接回复用 complete」约定），
+        # 此时若把 agent_msgs 直接写回 state，前端会读到 ToolMessage 的
+        # "Returning structured response: ..." 内部 dump。统一包装成干净 AIMessage。
+        if plan_output and plan_output.answer:
+            answer_msg = AIMessage(content=plan_output.answer)
+            writer({"type": THINK_MES, "messages": "📋 反思通过，生成最终答案", "trace_id": trace_id})
+            return {"messages": [answer_msg], "completed": True, "plan_tasks": Overwrite(value=[])}
 
         # 没有计划输出 → agent 直接回复（澄清、审查结论等）
         writer({"type": THINK_MES, "messages": "📋 规划完成", "trace_id": trace_id})

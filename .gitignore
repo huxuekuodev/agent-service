@@ -21,6 +21,10 @@ logs/
 # 运行数据
 .deer-agent/
 
+# 前端依赖 / 构建产物
+web/node_modules/
+web/dist/
+
 # 测试
 .pytest_cache/
 .coverage

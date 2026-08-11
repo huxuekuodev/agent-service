@@ -129,25 +129,21 @@ async def chat_stream(session_id: str, req: ChatRequest, svc: AgentService = Dep
 
 
 def _serialize(chunk: dict) -> str:
-    """将信封序列化为 SSE 可传输的 JSON（消息对象转 dict）。"""
+    """将信封序列化为 SSE 可传输的 JSON。
+
+    任意深度嵌套的 LangChain 消息对象都会通过 :func:`_json_default` 转成 dict，
+    其余不可序列化对象降级为 str。
+    """
     import json
 
-    result: dict[str, Any] = {}
-    for k, v in chunk.items():
-        if k == "data" and isinstance(v, dict):
-            data: dict[str, Any] = {}
-            for dk, dv in v.items():
-                if dk == "messages" and isinstance(dv, list):
-                    data["messages"] = [_msg_to_dict(m) for m in dv]
-                else:
-                    data[dk] = dv
-            result[k] = data
-        elif k == "data" and isinstance(v, (tuple, list)) and len(v) == 2:
-            msg, meta = v
-            result[k] = {"message": _msg_to_dict(msg), "metadata": meta}
-        else:
-            result[k] = v
-    return json.dumps(result, ensure_ascii=False, default=str)
+    return json.dumps(chunk, ensure_ascii=False, default=_json_default)
+
+
+def _json_default(obj: Any) -> Any:
+    """JSON 兜底：LangChain 消息对象转 dict，其余转 str。"""
+    if hasattr(obj, "content"):
+        return _msg_to_dict(obj)
+    return str(obj)
 
 
 def _msg_to_dict(msg: Any) -> dict:

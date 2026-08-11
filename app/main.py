@@ -19,6 +19,7 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 # 加载环境变量（必须在导入 app.config 之前）
@@ -52,6 +53,18 @@ app = FastAPI(
     description="独立 Agent 服务：LangGraph planner-execute 模式",
     version="0.1.0",
     lifespan=lifespan,
+)
+
+# 前后端分离：允许 Vite 开发服务器（5173）跨域访问
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # 注册路由
