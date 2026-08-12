@@ -75,20 +75,22 @@ agent-service/
     │   │   ├── step_dispatch_node.py # 派发节点：筛选就绪任务 + fan-out 路由（Send/END）
     │   │   └── constants.py  # 共享常量（thinkMessage 等）
     │   ├── subagent/
-    │   │   └── general_agent.py  # 通用执行 agent：执行单任务并写回结果
+    │   │   └── general_agent.py  # 通用执行 agent：执行单任务并写回结果（含执行评估触发）
     │   ├── middlewares/
     │   │   ├── clarification_middleware.py   # 拦截 ask_clarification 并呈现给用户
     │   │   └── dangling_tool_call_middleware.py # 修复历史中悬空的 tool_call
     │   └── evaluation/
     │       ├── base.py       # BaseEvaluator 抽象基类（指标开关/阈值/LLM 打分/JSON 解析）
     │       ├── registry.py   # 评估器工厂（按 config `evaluators` 列表实例化）
-    │       └── plan_evaluator.py  # PlanEvaluator：澄清质量 / 任务原子性 / agent 选择合法性
+    │       ├── plan_evaluator.py  # PlanEvaluator：澄清质量 / 任务原子性 / agent 选择合法性
+    │       └── general_evaluator.py # GeneralEvaluator：执行节点路径效率（1-5 分）
     ├── routers/
     │   ├── sessions.py       # 会话与对话接口（创建/列表/删除/chat SSE/chat sync）
     │   └── health.py         # 健康检查
     └── prompts/
         ├── plan_system_prompt_v2.md      # 规划节点系统提示词
-        └── general_agent_system_prompt.md # 通用执行 agent 系统提示词
+        ├── general_agent_system_prompt.md # 通用执行 agent 系统提示词
+        └── general_evaluator_prompt.md    # 执行节点评估提示词（本地副本，Langfuse 兜底）
 ```
 
 ## 配置入口

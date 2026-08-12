@@ -94,6 +94,18 @@ evaluators:
       agent_selection_validity:
         enabled: true
         pass_score: 0.8
+  - name: general_evaluation
+    display_name: "执行评估"
+    use: app.agents.evaluation.general_evaluator:GeneralEvaluator
+    model: evaluate_model
+    # 系统提示词由 Langfuse prompt general_evaluator_prompt 提供（唯一来源，
+    # 本地副本 app/prompts/general_evaluator_prompt.md 仅保存参考，不读取）。
+    enabled: true
+    sample_rate: 1.0
+    metrics:
+      path_efficiency:
+        enabled: true
+        pass_score: 3.0
 
 # 执行 agent 配置
 subagents:

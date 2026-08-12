@@ -15,10 +15,13 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.runtime import Runtime
 
+from app.agents.evaluation.general_evaluator import maybe_evaluate_general
 from app.agents.lead_agent import GraphContext, create_llm_with_name
 from app.agents.subtask import SubTask
 from app.agents.thread_state import ThreadState
 from app.agents.tools import describe_execute_tools_v2, get_execute_tools
+from app.core.context import trace_id_ctx_var
+from app.core.log import logger
 
 
 async def general_agent(state: ThreadState, config: RunnableConfig, runtime: Runtime[GraphContext]) -> dict:
@@ -40,6 +43,8 @@ async def general_agent(state: ThreadState, config: RunnableConfig, runtime: Run
     task_name = state.get("task_name", "未知任务")
     task_desc = state.get("task_desc", "")
     plan_tasks = state.get("plan_tasks", [])
+    # 优先从 config 取真实 trace_id（GraphAgent.astream 注入），兜底 ContextVar
+    trace_id = (config.get("configurable") or {}).get("trace_id") or trace_id_ctx_var.get()
 
     if not plan_id:
         return {"completed": True}
@@ -78,6 +83,22 @@ async def general_agent(state: ThreadState, config: RunnableConfig, runtime: Run
     agent_msgs = agent_result.get("messages", [])
     final_msg = agent_msgs[-1] if agent_msgs else AIMessage(content="")
     task_result = final_msg.content if hasattr(final_msg, "content") else str(final_msg)
+
+    # === 2.1 执行节点评估（LLM-as-Judge，非致命）===
+    # 评估执行 agent 的工具调用路径效率；未配置 / 被禁用 / 失败时静默跳过，不影响主流程。
+    try:
+        await maybe_evaluate_general(
+            trace_id=trace_id,
+            task_info=task_info,
+            messages=agent_msgs,
+            tools_desc=tools_desc,
+            current_time=runtime.context.current_time,
+            config=config,
+            runtime=runtime,
+        )
+    except Exception as exc:
+        logger.warning("General evaluation skipped (trace_id={}): {}", trace_id, exc, extra={"trace_id": trace_id})
+
     # === 3. 修改任务状态为 completed ===
     return {"plan_tasks": [SubTask(plan_id=plan_id, step_statuses="completed", result=str(task_result))]}
 
