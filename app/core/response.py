@@ -22,13 +22,13 @@ OK = 200
 # 业务错误编码（自定义，从 1000 起）
 # ---------------------------------------------------------------------------
 # 通用
-BAD_REQUEST = 1000        # 请求参数错误
-NOT_FOUND = 1001          # 资源不存在（会话/线程）
-INTERNAL_ERROR = 1002     # 服务内部错误
+BAD_REQUEST = 1000  # 请求参数错误
+NOT_FOUND = 1001  # 资源不存在（会话/线程）
+INTERNAL_ERROR = 1002  # 服务内部错误
 
 # 会话相关（1100 - 1199）
 SESSION_NOT_FOUND = 1100  # 会话不存在
-SESSION_EXISTS = 1101     # 会话已存在（创建时冲突）
+SESSION_EXISTS = 1101  # 会话已存在（创建时冲突）
 SERVICE_NOT_READY = 1102  # AgentService 未初始化
 
 

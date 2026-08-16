@@ -34,10 +34,7 @@ def make_internal_kb_tool(**extra: Any) -> BaseTool:
     endpoint = str(extra.get("endpoint") or "")
     api_key = str(extra.get("api_key") or "")
     if not endpoint or not api_key:
-        raise ValueError(
-            "internal_kb 需要配置 extra.endpoint 与 extra.api_key "
-            "（建议 .env 设置 KB_ENDPOINT / KB_API_KEY）"
-        )
+        raise ValueError("internal_kb 需要配置 extra.endpoint 与 extra.api_key （建议 .env 设置 KB_ENDPOINT / KB_API_KEY）")
 
     @tool("internal_kb", parse_docstring=True)
     async def internal_kb_tool(query: str, top_k: int = 3) -> str:
@@ -61,10 +58,7 @@ def make_internal_kb_tool(**extra: Any) -> BaseTool:
             hits = data.get("results") or data.get("hits") or []
             if not hits:
                 return "未找到相关知识库内容。"
-            lines = [
-                f"- {h.get('title') or '(无标题)'}\n  URL: {h.get('url') or ''}\n  {(h.get('content') or h.get('text') or '').strip()}"
-                for h in hits[:top_k]
-            ]
+            lines = [f"- {h.get('title') or '(无标题)'}\n  URL: {h.get('url') or ''}\n  {(h.get('content') or h.get('text') or '').strip()}" for h in hits[:top_k]]
             return "\n\n".join(lines)
 
     return internal_kb_tool

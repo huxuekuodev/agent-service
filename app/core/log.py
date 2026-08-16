@@ -28,6 +28,7 @@ def _resolve_log_level() -> tuple[str, str | None]:
     # 从 config.yaml 读取
     try:
         import yaml
+
         from app.config import _find_config_file
 
         path = _find_config_file()

@@ -50,6 +50,53 @@ models:
     max_retries: 2
     supports_thinking: false
     supports_vision: false
+  - name: vision_model
+    display_name: "视觉模型（图片转文字）"
+    use: langchain_openai:ChatOpenAI
+    model: gpt-4o-mini
+    api_key: $OPENAI_API_KEY
+    base_url:
+    max_tokens: 4096
+    timeout: 300.0
+    max_retries: 2
+    supports_thinking: false
+    supports_vision: true
+
+# 语雀数据源（知识库摄取）
+yuque:
+  enabled: false
+  token: $YUQUE_TOKEN          # 语雀个人令牌
+  login:                       # 拉取用户/组织知识库的登录名（为空需在请求里显式传 repos）
+  group_repos: false           # true 用 /groups/{login}/repos（组织），false 用 /users/{login}/repos（个人）
+  namespaces: []               # 白名单 namespace（org/repo）；空表示拉全部
+
+# 知识库摄取流水线（分块 + 图片转文字 + 入 ES）
+ingest:
+  enabled: false
+  vision_model: vision_model   # 图片转文字用的视觉模型（models 列表里 supports_vision: true 的条目）
+  chunk_size: 2000             # 最大 chunk 字符数
+  overlap: 200                 # chunk 重叠字符数
+  download_images: true        # 是否下载文档图片并转文字
+  image_placeholder: "![image]({url})"
+  auto_interval_seconds: 0     # 自动同步间隔（秒）；0 关闭。启用后由 FastAPI 后台任务定时触发
+  parallel: 4                  # 文档并发处理数
+
+# ElasticSearch 向量库（见 docs/RAG_方案.md）
+elasticsearch:
+  url: http://localhost:9200
+  index: rag_docs
+  dims: 1536
+  username:
+  password:
+  verify_certs: true
+  reindex_on_ingest: true      # 每次摄取前重建索引（简化全量同步）
+
+# Embedding 模型（向量化 chunk）
+embedding:
+  model: text-embedding-3-small
+  api_key: $EMBEDDING_API_KEY
+  base_url:
+  dimensions: 1536
 
 # Langfuse 追踪/评估
 langfuse:

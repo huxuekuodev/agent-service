@@ -23,8 +23,8 @@ from app.agent_service import AgentService
 from app.core.log import logger
 from app.core.response import (
     INTERNAL_ERROR,
-    SESSION_NOT_FOUND,
     SERVICE_NOT_READY,
+    SESSION_NOT_FOUND,
     BizError,
     err,
     ok,
@@ -44,8 +44,7 @@ def get_service(request: Request) -> AgentService:
     if service is None:
         raise BizError(
             SERVICE_NOT_READY,
-            "AgentService 未初始化：请通过 FastAPI app 启动（uvicorn app.main:app），"
-            "lifespan 会创建并注入 app.state.agent_service。",
+            "AgentService 未初始化：请通过 FastAPI app 启动（uvicorn app.main:app），lifespan 会创建并注入 app.state.agent_service。",
         )
     return service
 
@@ -65,9 +64,7 @@ class ChatRequest(BaseModel):
 
 
 @router.post("")
-async def create_session(
-    req: CreateSessionRequest, svc: AgentService = Depends(get_service)
-) -> dict[str, Any]:
+async def create_session(req: CreateSessionRequest, svc: AgentService = Depends(get_service)) -> dict[str, Any]:
     """创建新会话。"""
     result = svc.create_session(model_name=req.model_name)
     logger.info("创建会话: {}", result["session_id"])

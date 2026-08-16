@@ -272,6 +272,119 @@ class DatabaseConfig:
 
 
 @dataclass
+class YuqueConfig:
+    """语雀数据源配置。"""
+
+    enabled: bool = False
+    token: str = ""
+    """语雀个人令牌（建议 .env 用 YUQUE_TOKEN 注入）。"""
+    login: str = ""
+    """用于列出用户/组织知识库的登录名；为空时路由需显式传 repos。"""
+    group_repos: bool = False
+    """True 时用 /groups/{login}/repos 拉组织知识库，否则拉用户知识库。"""
+    namespaces: list[str] = field(default_factory=list)
+    """需要同步的知识库 namespace（org/repo）白名单；为空表示拉全部。"""
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> YuqueConfig:
+        d = d or {}
+        return cls(
+            enabled=bool(d.get("enabled", False)),
+            token=_resolve_env(d.get("token")),
+            login=_resolve_env(d.get("login")),
+            group_repos=bool(d.get("group_repos", False)),
+            namespaces=list(d.get("namespaces") or []),
+        )
+
+
+@dataclass
+class ElasticsearchConfig:
+    """ElasticSearch 向量库配置（见 docs/RAG_方案.md）。"""
+
+    url: str = "http://localhost:9200"
+    index: str = "rag_docs"
+    dims: int = 1536
+    """embedding 向量维度，必须与 embedding 模型一致。"""
+    username: str | None = None
+    password: str | None = None
+    verify_certs: bool = True
+    reindex_on_ingest: bool = False
+    """每次摄取前是否删除重建索引（简化全量同步）。"""
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> ElasticsearchConfig:
+        d = d or {}
+        return cls(
+            url=_resolve_env(d.get("url", "http://localhost:9200")) or "http://localhost:9200",
+            index=_resolve_env(d.get("index", "rag_docs")) or "rag_docs",
+            dims=int(d.get("dims", 1536)),
+            username=_resolve_env(d.get("username")),
+            password=_resolve_env(d.get("password")),
+            verify_certs=bool(d.get("verify_certs", True)),
+            reindex_on_ingest=bool(d.get("reindex_on_ingest", False)),
+        )
+
+
+@dataclass
+class EmbeddingConfig:
+    """Embedding 模型配置（向量化 chunk）。"""
+
+    model: str = "text-embedding-3-small"
+    """embedding 模型名。"""
+    api_key: str = ""
+    """embedding API Key（.env 用 EMBEDDING_API_KEY 注入）。"""
+    base_url: str | None = None
+    dimensions: int = 1536
+    """向量维度，与 ElasticsearchConfig.dims 一致。"""
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> EmbeddingConfig:
+        d = d or {}
+        return cls(
+            model=_resolve_env(d.get("model", "text-embedding-3-small")) or "text-embedding-3-small",
+            api_key=_resolve_env(d.get("api_key")),
+            base_url=_resolve_env(d.get("base_url")),
+            dimensions=int(d.get("dimensions", 1536)),
+        )
+
+
+@dataclass
+class KnowledgeIngestConfig:
+    """知识库摄取流水线配置。"""
+
+    enabled: bool = False
+    """知识库摄取总开关。"""
+    vision_model: str = ""
+    """图片转文字用的视觉模型名（对应 models 列表里 supports_vision: true 的条目）。"""
+    chunk_size: int = 2000
+    """最大 chunk 字符数（按标题层级语义切分）。"""
+    overlap: int = 200
+    """chunk 相邻重叠字符数。"""
+    download_images: bool = True
+    """是否下载文档内图片并转文字；关闭时图片仅保留占位标记。"""
+    image_placeholder: str = "![image]({url})"
+    """图片占位标记模板。"""
+    auto_interval_seconds: int = 0
+    """自动同步间隔（秒）；0 表示关闭自动同步。"""
+    parallel: int = 4
+    """文档并发处理数。"""
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> KnowledgeIngestConfig:
+        d = d or {}
+        return cls(
+            enabled=bool(d.get("enabled", False)),
+            vision_model=_resolve_env(d.get("vision_model")) or "",
+            chunk_size=int(d.get("chunk_size", 2000)),
+            overlap=int(d.get("overlap", 200)),
+            download_images=bool(d.get("download_images", True)),
+            image_placeholder=str(d.get("image_placeholder", "![image]({url})")),
+            auto_interval_seconds=int(d.get("auto_interval_seconds", 0)),
+            parallel=max(1, int(d.get("parallel", 4))),
+        )
+
+
+@dataclass
 class AppConfig:
     """独立服务的全局配置。"""
 
@@ -283,6 +396,18 @@ class AppConfig:
     """模型列表，第一个为默认模型。"""
 
     langfuse: LangfuseConfig = field(default_factory=LangfuseConfig)
+
+    # 数据源：语雀
+    yuque: YuqueConfig = field(default_factory=YuqueConfig)
+
+    # 知识库摄取流水线
+    ingest: KnowledgeIngestConfig = field(default_factory=KnowledgeIngestConfig)
+
+    # ElasticSearch 向量库
+    elasticsearch: ElasticsearchConfig = field(default_factory=ElasticsearchConfig)
+
+    # Embedding 模型
+    embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
 
     # 规划评估（LLM-as-Judge，旧配置，向后兼容）
     plan_evaluation: PlanEvaluationSettings = field(default_factory=PlanEvaluationSettings)
@@ -327,6 +452,10 @@ class AppConfig:
             tools=[ToolConfig.from_dict(t) for t in data.get("tools") or []],
             storage_dir=str(data.get("storage_dir", ".deer-agent")),
             database=DatabaseConfig.from_dict(data.get("database")),
+            yuque=YuqueConfig.from_dict(data.get("yuque")),
+            ingest=KnowledgeIngestConfig.from_dict(data.get("ingest")),
+            elasticsearch=ElasticsearchConfig.from_dict(data.get("elasticsearch")),
+            embedding=EmbeddingConfig.from_dict(data.get("embedding")),
         )
 
     def get_model_config(self, name: str) -> ModelConfig | None:
@@ -340,6 +469,21 @@ class AppConfig:
         for e in self.evaluators:
             if e.name == name:
                 return e
+        return None
+
+    def get_vision_model(self) -> ModelConfig | None:
+        """返回第一个 supports_vision=True 的模型（图片转文字用）。
+
+        优先返回 ``ingest.vision_model`` 指定的模型，其次返回配置中第一个
+        声明支持视觉的模型；都没有则返回 None。
+        """
+        if self.ingest.vision_model:
+            cfg = self.get_model_config(self.ingest.vision_model)
+            if cfg is not None:
+                return cfg
+        for m in self.models:
+            if m.supports_vision:
+                return m
         return None
 
     @property

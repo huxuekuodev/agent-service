@@ -144,10 +144,7 @@ class AgentService:
     def _require_agent(self) -> GraphAgent:
         """确保服务已进入生命周期（__aenter__ 初始化了 agent）。"""
         if self._agent is None:
-            raise RuntimeError(
-                "AgentService 未初始化：请使用 `async with AgentService() as svc:` "
-                "进入生命周期后再调用对话接口。"
-            )
+            raise RuntimeError("AgentService 未初始化：请使用 `async with AgentService() as svc:` 进入生命周期后再调用对话接口。")
         return self._agent
 
     async def chat(self, session_id: str, message: str) -> list[dict]:

@@ -6,12 +6,10 @@
 from __future__ import annotations
 
 from importlib import import_module
-from typing import TypeVar, cast
-
-T = TypeVar("T")
+from typing import cast
 
 
-def resolve_variable(
+def resolve_variable[T](
     variable_path: str,
     expected_type: type[T] | tuple[type, ...] | None = None,
 ) -> T:
@@ -48,7 +46,7 @@ def resolve_variable(
     return cast(T, variable)
 
 
-def resolve_class(  # noqa: UP047
+def resolve_class[T](
     variable_path: str,
     base_class: type[T] | tuple[type[T], ...],
 ) -> type[T]:

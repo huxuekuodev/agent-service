@@ -27,24 +27,47 @@ load_dotenv()
 
 from app.core.log import logger  # noqa: E402
 from app.core.response import BAD_REQUEST, INTERNAL_ERROR, NOT_FOUND, BizError, err  # noqa: E402
-from app.routers import health, sessions  # noqa: E402
+from app.routers import health, knowledge, sessions  # noqa: E402
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """应用 lifespan：管理 AgentService 资源生命周期。"""
+    """应用 lifespan：管理 AgentService / 知识库摄取服务资源生命周期。"""
     from app.agent_service import AgentService
+    from app.config import get_app_config
+    from app.rag.ingest_service import KnowledgeIngestService
 
     # 进入服务生命周期（打开 postgres 连接池 + setup 建表；memory 直接可用）
     service = await AgentService().__aenter__()
     app.state.agent_service = service
     logger.info("Deer Agent Service 启动，AgentService 已初始化")
 
+    # 知识库摄取服务（语雀 → 分块 → 图片转文字 → ES；独立于主对话 Agent）
+    # 手动接口可用性取决于 yuque.enabled；自动同步再叠加 ingest.enabled + auto_interval_seconds。
+    ingest_service: KnowledgeIngestService | None = None
+    config = get_app_config()
+    if config.ingest.enabled or config.yuque.enabled:
+        try:
+            ingest_service = KnowledgeIngestService(app_config=config)
+            await ingest_service.start_auto_sync()
+            app.state.knowledge_ingest_service = ingest_service
+            logger.info("知识库摄取服务已初始化（自动同步: {}）", "开" if ingest_service.auto_task_running else "关")
+        except Exception as exc:
+            logger.warning("知识库摄取服务初始化失败（跳过）: {}", exc)
+            ingest_service = None
+    else:
+        logger.info("知识库摄取服务未启用（config.ingest.enabled=false 且 config.yuque.enabled=false）")
+
     try:
         yield
     finally:
-        # 释放资源（关闭 postgres 连接池）
+        # 释放资源（关闭 postgres 连接池 + 摄取服务）
         await service.__aexit__(None, None, None)
+        if ingest_service is not None:
+            try:
+                await ingest_service.aclose()
+            except Exception as exc:
+                logger.warning("知识库摄取服务关闭异常: {}", exc)
         logger.info("Deer Agent Service 关闭，AgentService 已释放")
 
 
@@ -70,6 +93,7 @@ app.add_middleware(
 # 注册路由
 app.include_router(health.router)
 app.include_router(sessions.router)
+app.include_router(knowledge.router)
 
 
 # ---------------------------------------------------------------------------
