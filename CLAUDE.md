@@ -50,8 +50,12 @@ agent-service/
     │   ├── log.py            # loguru 配置（trace_id 注入日志格式）
     │   ├── reflection.py     # 动态模块/类加载（resolve_class / resolve_variable）
     │   └── runtime.py        # RunContext（注入 checkpointer / app_config 到图运行时）
+    ├── llm/                  # 大模型渠道管理（每个渠道一个实例，只配置一套；所有 LLM 操作在此）
+    │   ├── base.py           # LLMInstance 数据类 + 注册表（register / get / list）
+    │   ├── factory.py        # create_chat_model：按角色名→实例构建 ChatModel
+    │   ├── builders.py       # create_llm / create_llm_with_name / create_execution_llm（按运行配置构建）
+    │   └── instances/        # 渠道实例：deepseek / deepseek_bak / openai / qwen
     ├── agents/
-    │   ├── models.py         # 模型工厂：从配置实例化 ChatModel（thinking/vision 标志）
     │   ├── thread_state.py   # LangGraph 线程状态定义（messages + plan_tasks，reducer）
     │   ├── subtask.py        # SubTask 数据模型（DAG 子任务）
     │   ├── plan_document.py  # Plan DAG 数据模型（v1 遗留，StepStatus 等）
@@ -62,13 +66,13 @@ agent-service/
     │   │   ├── registry.py   # 从 config `tools` 段加载工具类，按 allowed_agents 过滤
     │   │   ├── builtin.py    # 内置工具：ask_clarification（澄清）
     │   │   ├── web/          # 联网类工具（web_search，基于 Tavily API）
-    │   │   └── knowledge/    # 知识库类工具（internal_kb 私有知识库示例）
+    │   │   ├── knowledge/    # 知识库类工具（internal_kb 私有知识库示例）
+    │   │   └── yuque/        # 语雀类工具（newest_doc 文档修订对比）
     │   ├── errors.py         # 规划节点 LLM 错误分类（可重试 vs 不可恢复）
     │   ├── current_time.py   # <current_time> 注入辅助（避免重复注入，可单测）
     │   ├── lead_agent/
     │   │   ├── agent.py      # 主图 GraphAgent（无状态编译图 + Send 并行派发）
     │   │   ├── graph_context.py  # GraphContext（app_config / plan_llm / langfuse_client 注入）
-    │   │   ├── llm.py        # LLM 构建（create_llm / create_llm_with_name / create_execution_llm）
     │   │   └── tools.py      # 步骤执行工具定义
     │   ├── nodes/
     │   │   ├── plan_model_node.py   # 规划节点：澄清 + 规划 + 审查（结构化输出 SubTask DAG）
@@ -82,7 +86,7 @@ agent-service/
     │   └── evaluation/
     │       ├── base.py       # BaseEvaluator 抽象基类（指标开关/阈值/LLM 打分/JSON 解析）
     │       ├── registry.py   # 评估器工厂（按 config `evaluators` 列表实例化）
-    │       ├── plan_evaluator.py  # PlanEvaluator：澄清质量 / 任务原子性 / agent 选择合法性
+    │       ├── plan_evaluator.py  # PlanEvaluator：任务原子性/依赖正确性/决策准确性等（Langfuse plan_evaluator_prompt）
     │       └── general_evaluator.py # GeneralEvaluator：执行节点路径效率（1-5 分）
     ├── routers/
     │   ├── sessions.py       # 会话与对话接口（创建/列表/删除/chat SSE/chat sync）
@@ -90,12 +94,13 @@ agent-service/
     └── prompts/
         ├── plan_system_prompt_v2.md      # 规划节点系统提示词
         ├── general_agent_system_prompt.md # 通用执行 agent 系统提示词
-        └── general_evaluator_prompt.md    # 执行节点评估提示词（本地副本，Langfuse 兜底）
+        ├── plan_evaluator_prompt.md      # 规划评估提示词（本地副本，Langfuse 唯一来源）
+        └── general_evaluator_prompt.md    # 执行节点评估提示词（本地副本，Langfuse 唯一来源）
 ```
 
 ## 配置入口
 
-`config.yaml` 是唯一配置源（路径优先级：显式 `config_path` > `AGENT_CONFIG_PATH` > `./config.yaml`），支持 `$ENV` 变量引用 `.env` 中的密钥。关键段：`models`（模型列表，首个为默认）、`langfuse`（追踪开关）、`plan_evaluation`（旧评估配置，向后兼容）、`evaluators`（推荐的可插拔评估器列表）、`subagents`、`database`（`memory` / `postgres`）。
+`config.yaml` 是唯一配置源（路径优先级：显式 `config_path` > `AGENT_CONFIG_PATH` > `./config.yaml`），支持 `$ENV` 变量引用 `.env` 中的密钥。关键段：`models`（模型角色 → LLM 实例名映射，实例见 `app/llm/instances/`，每个实例只配置一套）、`langfuse`（追踪开关）、`plan_evaluation`（旧评估配置，向后兼容）、`evaluators`（推荐的可插拔评估器列表）、`subagents`、`database`（`memory` / `postgres`）。
 
 
 ## 项目规则

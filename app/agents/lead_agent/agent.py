@@ -22,13 +22,14 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import RetryPolicy
 
 from app.agents.errors import should_retry
-from app.agents.lead_agent import GraphContext, create_llm
+from app.agents.lead_agent import GraphContext
 from app.agents.nodes import plan_model_node, step_dispatch_node, step_fan_out_router
 from app.agents.plan_storage import get_plan_storage
 from app.agents.subagent.general_agent import general_agent
 from app.agents.thread_state import ThreadState
 from app.config import get_app_config
 from app.core.runtime import RunContext
+from app.llm import create_llm
 
 # 规划节点重试策略：仅对可恢复的 LLM 错误重试（超时/连接/5xx/429/服务繁忙），
 # 欠费/认证失败等不可恢复错误不重试（直接返回友好提示）。
@@ -124,7 +125,7 @@ class GraphAgent:
         # 每次请求动态构建 config（thread_id 按请求传入）
         configurable: dict[str, Any] = {
             "thread_id": thread_id,
-            "model_name": model_name or self._app_config.default_model.name,
+            "model_name": model_name or self._app_config.default_model_name,
         }
         if trace_id:
             configurable["trace_id"] = trace_id
@@ -142,7 +143,7 @@ class GraphAgent:
             yield st
 
     def get_context(self, model_name: str | None = None) -> GraphContext:
-        config: RunnableConfig = {"configurable": {"model_name": model_name or self._app_config.default_model.name}}
+        config: RunnableConfig = {"configurable": {"model_name": model_name or self._app_config.default_model_name}}
         return GraphContext(
             app_config=self._app_config,
             plan_llm=create_llm(config),

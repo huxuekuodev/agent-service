@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from app.config import AppConfig, YuqueConfig
 from app.rag.ingest_service import _merge_image_descriptions
 from app.rag.models import DocChunk, ImageDescription
@@ -9,7 +11,7 @@ from app.rag.models import DocChunk, ImageDescription
 
 def test_config_parses_new_sections() -> None:
     data = {
-        "models": [{"name": "default", "use": "langchain_deepseek:ChatDeepSeek", "model": "deepseek-chat"}],
+        "models": {"default": "deepseek", "vision_model": "qwen_vl"},
         "yuque": {"enabled": True, "token": "$YUQUE_TOKEN", "login": "huxuekuo", "group_repos": False, "namespaces": ["org/repo"]},
         "ingest": {"enabled": True, "vision_model": "vision_model", "chunk_size": 1500, "overlap": 100, "download_images": True, "auto_interval_seconds": 3600, "parallel": 3},
         "elasticsearch": {"url": "http://localhost:9200", "index": "rag_docs", "dims": 1024, "reindex_on_ingest": True},
@@ -17,7 +19,10 @@ def test_config_parses_new_sections() -> None:
     }
     cfg = AppConfig.from_dict(data)
     assert isinstance(cfg.yuque, YuqueConfig)
-    assert cfg.yuque.token == "$YUQUE_TOKEN"
+    assert cfg.models == {"default": "deepseek", "vision_model": "qwen_vl"}
+    assert cfg.default_model_name == "default"
+    assert cfg.get_model_config("plan_node_model") is None
+    assert cfg.yuque.token == os.getenv("YUQUE_TOKEN", "")
     assert cfg.yuque.namespaces == ["org/repo"]
     assert cfg.ingest.chunk_size == 1500
     assert cfg.ingest.auto_interval_seconds == 3600

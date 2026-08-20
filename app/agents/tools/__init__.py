@@ -7,8 +7,10 @@
     ├── registry.py          # 从 config.yaml `tools` 段加载工具类，按可用 agent 过滤
     ├── web/                 # 联网类工具（web_search 等）
     │   └── web_search.py
-    └── knowledge/           # 知识库类工具（私有/外部知识库检索等）
-        └── internal_kb.py
+    ├── knowledge/           # 知识库类工具（私有/外部知识库检索等）
+    │   └── internal_kb.py
+    └── yuque/               # 语雀类工具（文档修订对比等）
+        └── newest_doc.py
 
 config.yaml 中的 ``tools`` 段声明每个工具：name / use（类 import 路径）/ category
 （业务分类）/ allowed_agents（可用 agent 列表）/ enabled / extra（工具特有参数）。

@@ -75,14 +75,14 @@ class KnowledgeIngestService:
         return self.yuque
 
     def _get_vision_llm(self) -> BaseChatModel:
-        """创建视觉 LLM（基于 config.ingest.vision_model / supports_vision）。"""
+        """创建视觉 LLM（基于 config.ingest.vision_model / models 中的视觉实例）。"""
         if self._vision_llm is None:
-            vision_cfg = self.config.get_vision_model()
-            if vision_cfg is None:
-                raise RuntimeError("未配置视觉模型：请添加 supports_vision: true 的模型条目，或在 ingest.vision_model 指定")
-            from app.agents.models import create_chat_model
+            vision_role = self.config.get_vision_model()
+            if vision_role is None:
+                raise RuntimeError("未配置视觉模型：请在 models 中配置指向 supports_vision 实例的角色，或在 ingest.vision_model 指定角色名")
+            from app.llm import create_chat_model
 
-            self._vision_llm = create_chat_model(name=vision_cfg.name, app_config=self.config)
+            self._vision_llm = create_chat_model(name=vision_role, app_config=self.config)
         return self._vision_llm
 
     def _get_es(self) -> ElasticsearchStore:

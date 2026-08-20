@@ -4,63 +4,15 @@ logging:
   level: INFO
   file:
 
-# 模型列表，第一个为默认模型
+# 模型角色 → LLM 实例名（app/llm/instances/ 中注册的实例；每个实例只配置一套，
+# 模型类 / 模型名 / API Key 环境变量 / 端点 / 超时等都在实例里定义）。
+# 换渠道或换 key：新增一个实例文件并把角色指向它即可，无需重复配置。
 models:
-  - name: default
-    display_name: "DeepSeek"
-    use: langchain_deepseek:ChatDeepSeek
-    model: deepseek-chat
-    api_key: $DEEPSEEK_API_KEY
-    base_url:
-    max_tokens: 8192
-    timeout: 600.0
-    max_retries: 2
-    supports_thinking: false
-    supports_vision: false
-  - name: plan_node_model
-    display_name: "规划节点模型"
-    use: langchain_deepseek:ChatDeepSeek
-    model: deepseek-chat
-    api_key: $DEEPSEEK_API_KEY
-    base_url:
-    max_tokens: 8192
-    timeout: 600.0
-    max_retries: 2
-    supports_thinking: false
-    supports_vision: false
-  - name: general_node_model
-    display_name: "执行节点模型"
-    use: langchain_deepseek:ChatDeepSeek
-    model: deepseek-chat
-    api_key: $DEEPSEEK_API_KEY
-    base_url:
-    max_tokens: 8192
-    timeout: 600.0
-    max_retries: 2
-    supports_thinking: false
-    supports_vision: false
-  - name: evaluate_model
-    display_name: "评估模型"
-    use: langchain_deepseek:ChatDeepSeek
-    model: deepseek-chat
-    api_key: $DEEPSEEK_API_KEY
-    base_url:
-    max_tokens: 8192
-    timeout: 600.0
-    max_retries: 2
-    supports_thinking: false
-    supports_vision: false
-  - name: vision_model
-    display_name: "视觉模型（图片转文字）"
-    use: langchain_openai:ChatOpenAI
-    model: gpt-4o-mini
-    api_key: $OPENAI_API_KEY
-    base_url:
-    max_tokens: 4096
-    timeout: 300.0
-    max_retries: 2
-    supports_thinking: false
-    supports_vision: true
+  default: deepseek
+  plan_node_model: deepseek
+  general_node_model: deepseek
+  evaluate_model: deepseek
+  # vision_model: qwen_vl    # 可选：知识库图片转文字（对应 ingest.vision_model 角色名）
 
 # 语雀数据源（知识库摄取）
 yuque:
@@ -123,24 +75,31 @@ evaluators:
     display_name: "规划评估"
     use: app.agents.evaluation.plan_evaluator:PlanEvaluator
     model: evaluate_model
-    system_prompt: |
-      你是规划质量评估器。评估规划 agent 的决策质量，输出严格 JSON。
-      规划 agent 可能的三种输出：
-      1. 调用了 ask_clarification（clarification_requested=true）：需求含糊时澄清，是正确行为。
-      2. 输出计划（tasks 非空）：需求清晰时拆解为原子任务。
-      3. 直接回复（既未澄清也未产出计划）：若需求可执行却直接放弃，则是失败场景。
+    # 系统提示词由 Langfuse prompt plan_evaluator_prompt 提供（唯一来源，
+    # 本地副本 app/prompts/plan_evaluator_prompt.md 仅保存参考，不读取）。
     enabled: true
     sample_rate: 1.0
     metrics:
-      clarification_quality:
-        enabled: true
-        pass_score: 0.8
       task_atomicity:
+        label: "任务原子性"
         enabled: true
-        pass_score: 0.8
-      agent_selection_validity:
+        pass_score: 3.0
+      dependency_correctness:
+        label: "依赖关系正确性"
         enabled: true
-        pass_score: 0.8
+        pass_score: 3.0
+      plan_decision_accuracy:
+        label: "规划决策准确性"
+        enabled: true
+        pass_score: 3.0
+      variable_reference_accuracy:
+        label: "变量引用准确性"
+        enabled: true
+        pass_score: 3.0
+      tool_feasibility:
+        label: "工具可行性"
+        enabled: true
+        pass_score: 3.0
   - name: general_evaluation
     display_name: "执行评估"
     use: app.agents.evaluation.general_evaluator:GeneralEvaluator
@@ -177,6 +136,15 @@ tools:
     enabled: true
     extra:
       api_key: $TAVILY_API_KEY
+  - name: newest_doc
+    display_name: 语雀文档修订对比
+    use: app.agents.tools.yuque.newest_doc:make_newest_doc_tool
+    category: yuque
+    allowed_agents: [general_agent]
+    enabled: true
+    extra:
+      token: $YUQUE_TOKEN
+      login: $YUQUE_LOGIN
   - name: internal_kb
     display_name: 私有知识库
     use: app.agents.tools.knowledge.internal_kb:make_internal_kb_tool

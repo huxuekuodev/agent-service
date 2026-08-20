@@ -50,38 +50,16 @@ def _find_config_file() -> Path | None:
 
 @dataclass
 class ModelConfig:
-    """单个模型配置。"""
+    """模型角色配置：角色名 + 引用的 LLM 实例名（app/llm/instances/）。
+
+    config.yaml 的 ``models`` 段为 {角色名: LLM实例名} 映射，模型类、模型名、
+    API Key、端点等完整参数只在 app/llm/instances/ 的实例里配置一处。
+    """
 
     name: str
-    use: str = "langchain_openai:ChatOpenAI"
-    """模型类路径，如 langchain_openai:ChatOpenAI。"""
-    api_key: str | None = None
-    base_url: str | None = None
-    model: str | None = None
-    """模型名称（provider 侧）。"""
-    supports_thinking: str | None = None
-    """是否支持 thinking。"""
-    supports_vision: bool = False
-    max_tokens: int | None = None
-    temperature: float | None = None
-    timeout: float | None = None
-    max_retries: int | None = None
-
-    @classmethod
-    def from_dict(cls, d: dict) -> ModelConfig:
-        return cls(
-            name=_resolve_env(d.get("name", "default")) or "default",
-            use=_resolve_env(d.get("use", "langchain_openai:ChatOpenAI")) or "langchain_openai:ChatOpenAI",
-            api_key=_resolve_env(d.get("api_key")),
-            base_url=_resolve_env(d.get("base_url")),
-            model=_resolve_env(d.get("model")),
-            supports_thinking=_resolve_env(d.get("supports_thinking")),
-            supports_vision=bool(d.get("supports_vision", False)),
-            max_tokens=d.get("max_tokens"),
-            temperature=d.get("temperature"),
-            timeout=d.get("timeout"),
-            max_retries=d.get("max_retries"),
-        )
+    """角色名（config.yaml models 的 key，代码按它取模型）。"""
+    instance: str
+    """LLM 实例名（app/llm/instances/ 中注册的实例）。"""
 
 
 @dataclass
@@ -392,8 +370,8 @@ class AppConfig:
     log_level: str = "INFO"
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
-    models: list[ModelConfig] = field(default_factory=list)
-    """模型列表，第一个为默认模型。"""
+    models: dict[str, str] = field(default_factory=dict)
+    """模型角色 → LLM 实例名（见 app/llm/instances/，每个实例只配置一套）。"""
 
     langfuse: LangfuseConfig = field(default_factory=LangfuseConfig)
 
@@ -439,7 +417,10 @@ class AppConfig:
 
     @classmethod
     def from_dict(cls, data: dict) -> AppConfig:
-        models = [ModelConfig.from_dict(m) for m in data.get("models") or []]
+        models_raw = data.get("models") or {}
+        if not isinstance(models_raw, dict):
+            raise ValueError("config.yaml 的 models 段必须为 {角色名: LLM实例名} 映射（实例见 app/llm/instances/）")
+        models = {str(k): str(v) for k, v in models_raw.items()}
         return cls(
             config_version=int(data.get("config_version", 1)),
             log_level=str(data.get("log_level", "INFO")).upper(),
@@ -459,10 +440,11 @@ class AppConfig:
         )
 
     def get_model_config(self, name: str) -> ModelConfig | None:
-        for m in self.models:
-            if m.name == name:
-                return m
-        return None
+        """按角色名返回模型配置（角色 → 实例引用）；未配置返回 None。"""
+        instance = self.models.get(name)
+        if instance is None:
+            return None
+        return ModelConfig(name=name, instance=instance)
 
     def get_evaluator(self, name: str) -> EvaluatorSettings | None:
         """按名字取评估器配置。"""
@@ -471,24 +453,31 @@ class AppConfig:
                 return e
         return None
 
-    def get_vision_model(self) -> ModelConfig | None:
-        """返回第一个 supports_vision=True 的模型（图片转文字用）。
+    def get_vision_model(self) -> str | None:
+        """返回视觉模型角色名（图片转文字用）。
 
-        优先返回 ``ingest.vision_model`` 指定的模型，其次返回配置中第一个
-        声明支持视觉的模型；都没有则返回 None。
+        优先 ``ingest.vision_model`` 指定的角色；否则返回 ``models`` 中第一个
+        指向 supports_vision 实例的角色；都没有则返回 None。
         """
-        if self.ingest.vision_model:
-            cfg = self.get_model_config(self.ingest.vision_model)
-            if cfg is not None:
-                return cfg
-        for m in self.models:
-            if m.supports_vision:
-                return m
+        from app.llm.base import get_llm_instance
+
+        if self.ingest.vision_model and self.ingest.vision_model in self.models:
+            return self.ingest.vision_model
+        for role, instance_name in self.models.items():
+            try:
+                if get_llm_instance(instance_name).supports_vision:
+                    return role
+            except ValueError:
+                # 实例未注册：跳过，交由 create_chat_model 报清晰错误
+                continue
         return None
 
     @property
-    def default_model(self) -> ModelConfig:
-        return self.models[0] if self.models else ModelConfig(name="default")
+    def default_model_name(self) -> str:
+        """默认角色名：优先 ``models.default``，否则第一个角色。"""
+        if "default" in self.models:
+            return "default"
+        return next(iter(self.models), "")
 
 
 _config: AppConfig | None = None

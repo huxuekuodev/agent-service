@@ -214,13 +214,7 @@ class GeneralEvaluator(BaseEvaluator):
                 logger.warning("General evaluation skipped: prompt 'general_evaluator_prompt' unavailable")
                 return {}, {}
 
-            output_schema = json.dumps(
-                {name: 0.0 for name, cfg in self.get_metrics().items() if cfg.enabled} | {"rationale": "简要说明"},
-                ensure_ascii=False,
-            )
-            full_prompt = f"{system_prompt}\n【输出格式】严格 JSON，不要输出其他内容：\n{output_schema}"
-
-            response = await self._judge_llm.ainvoke(full_prompt, config=config)
+            response = await self._judge_llm.ainvoke(system_prompt, config=config)
             content = getattr(response, "content", None)
             raw = str(content) if content else ""
             raw = raw.strip()
@@ -261,6 +255,7 @@ class GeneralEvaluator(BaseEvaluator):
                 lambda: self._langfuse.get_prompt("general_evaluator_prompt", type="text").compile(
                     history_messages=history_text,
                     tools_desc=tools_desc,
+                    output_schema=self._build_output_schema(),
                 )
             )
             if compiled is None:
@@ -297,12 +292,12 @@ async def maybe_evaluate_general(
 ) -> None:
     """按配置触发执行节点评估；未配置、被禁用、被采样或 Langfuse 不可用时静默跳过。
 
-    与 ``plan_model_node._maybe_evaluate`` 保持一致的触发模式，但更轻量：
+    与 ``plan_evaluator.maybe_evaluate_plan`` 保持一致的触发模式，但更轻量：
     直接从 config 读 ``general_evaluation`` 评估器设置，未配置则跳过（不引入旧配置兼容分支）。
     """
     try:
         from app.agents.evaluation.registry import create_evaluator
-        from app.agents.lead_agent import create_llm_with_name
+        from app.llm import create_llm_with_name
 
         context = runtime.context
         app_config = context.app_config

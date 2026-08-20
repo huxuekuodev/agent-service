@@ -16,12 +16,13 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.runtime import Runtime
 
 from app.agents.evaluation.general_evaluator import maybe_evaluate_general
-from app.agents.lead_agent import GraphContext, create_llm_with_name
+from app.agents.lead_agent import GraphContext
 from app.agents.subtask import SubTask
 from app.agents.thread_state import ThreadState
 from app.agents.tools import describe_execute_tools_v2, get_execute_tools
 from app.core.context import trace_id_ctx_var
 from app.core.log import logger
+from app.llm import create_llm_with_name
 
 
 async def general_agent(state: ThreadState, config: RunnableConfig, runtime: Runtime[GraphContext]) -> dict:

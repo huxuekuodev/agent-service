@@ -8,7 +8,7 @@
 
 from app.agents.evaluation.base import BaseEvaluationResult, BaseEvaluator, MetricConfig, MetricOutcome
 from app.agents.evaluation.general_evaluator import GeneralEvaluationInput, GeneralEvaluator, maybe_evaluate_general
-from app.agents.evaluation.plan_evaluator import EvaluationInput, PlanEvaluator
+from app.agents.evaluation.plan_evaluator import EvaluationInput, PlanEvaluator, maybe_evaluate_plan
 from app.agents.evaluation.registry import create_evaluator, create_evaluator_from_settings
 
 __all__ = [
@@ -20,6 +20,7 @@ __all__ = [
     "create_evaluator_from_settings",
     "EvaluationInput",
     "PlanEvaluator",
+    "maybe_evaluate_plan",
     "GeneralEvaluationInput",
     "GeneralEvaluator",
     "maybe_evaluate_general",

@@ -28,9 +28,8 @@ from pydantic import BaseModel, Field
 
 from app.agents.current_time import has_current_time_for_today
 from app.agents.errors import build_error_fallback_message, classify_llm_error
-from app.agents.evaluation.plan_evaluator import EvaluationInput
-from app.agents.evaluation.registry import create_evaluator
-from app.agents.lead_agent import GraphContext, create_llm_with_name
+from app.agents.evaluation.plan_evaluator import EvaluationInput, maybe_evaluate_plan
+from app.agents.lead_agent import GraphContext
 from app.agents.middlewares.clarification_middleware import ClarificationMiddleware
 from app.agents.middlewares.dangling_tool_call_middleware import DanglingToolCallMiddleware
 from app.agents.nodes.constants import THINK_MES
@@ -38,6 +37,7 @@ from app.agents.subtask import SubTask
 from app.agents.thread_state import ThreadState
 from app.core.context import trace_id_ctx_var
 from app.core.log import logger
+from app.llm import create_llm_with_name
 
 
 class PlanTask(BaseModel):
@@ -165,7 +165,7 @@ async def plan_model_node(state: ThreadState, config: RunnableConfig, runtime: R
         if plan_output:
             eval_input.plan_action = plan_output.action
             eval_input.tasks = [t.model_dump() for t in plan_output.tasks]
-        await _maybe_evaluate(
+        await maybe_evaluate_plan(
             trace_id=trace_id,
             eval_input=eval_input,
             messages=messages,
@@ -288,7 +288,7 @@ def _try_parse_plan(msg: AIMessage) -> PlanOutput | None:
 
 
 # ----------------------------------------------------------------------
-# 规划评估（实验性）
+# 规划评估输入捕获
 # ----------------------------------------------------------------------
 
 
@@ -318,88 +318,3 @@ def _capture_eval_input(
         plan_status=plan_context,
         current_time=current_time,
     )
-
-
-async def _maybe_evaluate(
-    *,
-    trace_id: str,
-    eval_input: EvaluationInput,
-    messages: list[BaseMessage],
-    config: RunnableConfig,
-    runtime: Runtime[GraphContext],
-) -> None:
-    """按配置触发规划评估；未配置、被禁用或被采样时静默跳过。"""
-    try:
-        context = runtime.context
-        app_config = context.app_config
-
-        # 优先用新式 evaluators 列表（name=plan_evaluation）；
-        # 未配置时回退旧式 plan_evaluation 块（向后兼容）。
-        eval_settings = app_config.get_evaluator("plan_evaluation")
-        enabled = bool(eval_settings is not None and eval_settings.enabled)
-        judge_model_name = eval_settings.model if eval_settings else None
-        sample_rate = eval_settings.sample_rate if eval_settings else 1.0
-
-        legacy_plan_eval = None
-        if eval_settings is None:
-            legacy_plan_eval = getattr(app_config, "plan_evaluation", None)
-            enabled = bool(legacy_plan_eval is not None and getattr(legacy_plan_eval, "enabled", False))
-            judge_model_name = getattr(legacy_plan_eval, "judge_model", None)
-            sample_rate = getattr(legacy_plan_eval, "sample_rate", 1.0)
-            if legacy_plan_eval is None or not enabled:
-                return
-
-        if not enabled:
-            return
-
-        # 允许的 execution_agent 集合：内置 general_agent + 配置的 custom_agents
-        enabled_agents: set[str] = set()
-        subagents_cfg = getattr(app_config, "subagents", None)
-        if subagents_cfg is not None:
-            custom = getattr(subagents_cfg, "custom_agents", {}) or {}
-            enabled_agents = set(custom.keys())
-
-        # Judge LLM：配置了 model / judge_model 就用它，否则用 plan_llm 兜底
-        def _build_judge_llm(model_name: str | None) -> Any | None:
-            if model_name:
-                try:
-                    return create_llm_with_name(config, model_name=model_name)
-                except Exception:
-                    return None
-            return context.plan_llm
-
-        # 新式 evaluators：走工厂（解析 use 子类 + 合并 metrics/系统提示词等）
-        evaluator = None
-        if eval_settings is not None:
-            evaluator = create_evaluator(
-                "plan_evaluation",
-                app_config,
-                llm_factory=lambda model_name: _build_judge_llm(model_name),
-                langfuse=context.langfuse_client,
-                extra={"enabled_agents": enabled_agents},
-            )
-        # 旧式 plan_evaluation 块：直接用 PlanEvaluator 构造
-        else:
-            from app.agents.evaluation.plan_evaluator import PlanEvaluator
-
-            dimensions = dict(getattr(legacy_plan_eval, "dimensions", {}) or {})
-            metrics = {name: {"enabled": val} for name, val in dimensions.items()}
-            evaluator = PlanEvaluator(
-                langfuse=context.langfuse_client,
-                enabled_agents=enabled_agents,
-                judge_llm=_build_judge_llm(judge_model_name),
-                metrics=metrics or None,
-                sample_rate=sample_rate,
-            )
-
-        if evaluator is None:
-            return
-
-        await evaluator.evaluate(
-            trace_id=trace_id,
-            prompt_input=evaluator.build_prompt_input(eval_input),
-            messages=messages,
-            config=config,
-        )
-    except Exception as exc:
-        logger.warning("Plan evaluation skipped: %s", exc)

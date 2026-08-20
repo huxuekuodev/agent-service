@@ -3,8 +3,10 @@
 from app.model.data.yuque.yuque import (
     YuqueClient,
     YuqueDoc,
+    YuqueDocVersion,
+    YuqueDocVersionDetail,
     YuqueError,
     YuqueRepo,
 )
 
-__all__ = ["YuqueClient", "YuqueDoc", "YuqueError", "YuqueRepo"]
+__all__ = ["YuqueClient", "YuqueDoc", "YuqueDocVersion", "YuqueDocVersionDetail", "YuqueError", "YuqueRepo"]
