@@ -17,7 +17,8 @@ Usage:
 import asyncio
 import uuid
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (AIMessage, HumanMessage, SystemMessage,
+                                     ToolMessage)
 
 from app.agents.lead_agent.agent import GraphAgent
 from app.config import get_app_config
@@ -173,7 +174,7 @@ async def main():
         runcontext = RunContext(checkpointer=saver, app_config=app_config)
         # 无状态图：全局复用，thread_id 每次传入
         agent = GraphAgent(runcontext)
-        userquery = "查询福建今天天气最凉爽的城市"
+        userquery = "查询北京的今天的天气"
         state = {"messages": [HumanMessage(content=userquery)]}
         thread_id = "debug-thread-001"
 

@@ -148,8 +148,9 @@ class ClarificationMiddleware(AgentMiddleware[ClarificationMiddlewareState]):
         # Return a Command that:
         # 1. Adds the formatted tool message
         # 2. Interrupts execution by going to __end__
-        # Note: We don't add an extra AIMessage here - the frontend will detect
-        # and display ask_clarification tool messages directly
+        # Note: 不在这里加 AIMessage——由 plan_model_node._clean_clarification_messages
+        # 把本 ToolMessage 的问题内容封装成 AIMessage 直接回复用户（替换整个
+        # [tool-call AIMessage + ToolMessage] 对），避免悬空 tool call 与重复上屏。
         return Command(
             update={"messages": [tool_message]},
             goto=END,

@@ -18,7 +18,8 @@ import asyncio
 from typing import Any, cast
 
 from langchain.agents import create_agent
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.messages import (AIMessage, BaseMessage, HumanMessage,
+                                     ToolMessage)
 from langchain_core.runnables import RunnableConfig
 from langfuse import Langfuse
 from langgraph.config import get_stream_writer
@@ -28,10 +29,13 @@ from pydantic import BaseModel, Field
 
 from app.agents.current_time import has_current_time_for_today
 from app.agents.errors import build_error_fallback_message, classify_llm_error
-from app.agents.evaluation.plan_evaluator import EvaluationInput, maybe_evaluate_plan
+from app.agents.evaluation.plan_evaluator import (EvaluationInput,
+                                                  maybe_evaluate_plan)
 from app.agents.lead_agent import GraphContext
-from app.agents.middlewares.clarification_middleware import ClarificationMiddleware
-from app.agents.middlewares.dangling_tool_call_middleware import DanglingToolCallMiddleware
+from app.agents.middlewares.clarification_middleware import \
+    ClarificationMiddleware
+from app.agents.middlewares.dangling_tool_call_middleware import \
+    DanglingToolCallMiddleware
 from app.agents.nodes.constants import THINK_MES
 from app.agents.subtask import SubTask
 from app.agents.thread_state import ThreadState
@@ -173,10 +177,11 @@ async def plan_model_node(state: ThreadState, config: RunnableConfig, runtime: R
             runtime=runtime,
         )
 
-        # 澄清：需求含糊时 agent 调用了 ask_clarification → 中断等待用户
+        # 澄清：需求含糊时 agent 调用了 ask_clarification → 中断等待用户。
+        # 澄清问题以 AIMessage 直接回复用户（替换中间的 [tool-call AIMessage + ToolMessage]）。
         if has_clarification:
             writer({"type": THINK_MES, "messages": "📋 需要澄清需求", "trace_id": trace_id})
-            return {"messages": agent_msgs, "completed": True}
+            return {"messages": _clean_clarification_messages(agent_msgs), "completed": True}
 
         # 反思通过：action=complete 且有最终答案 → 作为 AIMessage 追加到 messages 作为回复
         if plan_output and plan_output.action == "complete" and plan_output.answer:
@@ -285,6 +290,48 @@ def _try_parse_plan(msg: AIMessage) -> PlanOutput | None:
         pass
 
     return None
+
+
+# ----------------------------------------------------------------------
+# 澄清消息清理
+# ----------------------------------------------------------------------
+
+
+def _clean_clarification_messages(agent_msgs: list[BaseMessage]) -> list[BaseMessage]:
+    """把澄清的 [AIMessage(tool_calls) + ToolMessage] 对替换为一条干净的 AIMessage。
+
+    ask_clarification 的问题由 ClarificationMiddleware 格式化后写入 ToolMessage，
+    但 ToolMessage 是工具内部消息，不应作为对用户的回复；这里把问题内容封装成
+    AIMessage 直接回复用户，并丢弃带 tool_calls 的 AIMessage：
+
+    - 若只删 ToolMessage：下一轮会出现悬空 tool call，DanglingToolCallMiddleware
+      会注入 "[Tool call was interrupted...]" 错误占位消息污染历史；
+    - 若保留 ToolMessage 再追加 AIMessage：前端 streaming 会把两份相同内容都上屏。
+
+    Returns:
+        清理后的消息列表；未识别到澄清调用时原样返回。
+    """
+    ask_call_ids = {tc.get("id") for m in agent_msgs if isinstance(m, AIMessage) for tc in getattr(m, "tool_calls", None) or [] if tc.get("name") == "ask_clarification" and tc.get("id")}
+    if not ask_call_ids:
+        return agent_msgs
+
+    clarification_text = ""
+    kept: list[BaseMessage] = []
+    for m in agent_msgs:
+        if isinstance(m, ToolMessage) and m.tool_call_id in ask_call_ids:
+            clarification_text = str(m.content or "")
+            continue
+        if isinstance(m, AIMessage):
+            tool_calls = getattr(m, "tool_calls", None) or []
+            if any(tc.get("name") == "ask_clarification" for tc in tool_calls):
+                # 罕见情况：正文与澄清调用并存，保留正文
+                if getattr(m, "content", None):
+                    kept.append(AIMessage(content=str(m.content)))
+                continue
+        kept.append(m)
+    if clarification_text:
+        kept.append(AIMessage(content=clarification_text))
+    return kept
 
 
 # ----------------------------------------------------------------------

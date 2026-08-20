@@ -8,6 +8,8 @@ from app.llm.base import LLMInstance, register
 
 _QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
+_SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
+
 register(
     LLMInstance(
         name="qwen",
@@ -30,6 +32,22 @@ register(
         model="qwen-vl-plus",
         api_key_env="DASHSCOPE_API_KEY",
         base_url=_QWEN_BASE_URL,
+        supports_vision=True,
+        max_tokens=4096,
+        timeout=300.0,
+        max_retries=2,
+    )
+)
+
+register(
+    LLMInstance(
+        name="siliconflow_qwen",
+        display_name="硅基流动千问",
+        use="langchain_openai:ChatOpenAI",
+        model="Qwen/Qwen3-8B",
+        # model="Qwen/Qwen3-14B", # R1蒸馏款
+        api_key_env="SILICONFLOW_KEY",
+        base_url=_SILICONFLOW_BASE_URL,
         supports_vision=True,
         max_tokens=4096,
         timeout=300.0,
