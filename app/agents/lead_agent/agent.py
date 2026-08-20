@@ -24,7 +24,7 @@ from langgraph.types import RetryPolicy
 from app.agents.errors import should_retry
 from app.agents.lead_agent import GraphContext
 from app.agents.nodes import (plan_model_node, step_dispatch_node,
-                              step_fan_out_router)
+                              step_fan_out_router, summarization)
 from app.agents.nodes.general_agent import general_agent
 from app.agents.plan_storage import get_plan_storage
 from app.agents.thread_state import ThreadState
@@ -59,12 +59,13 @@ class GraphAgent:
         if self._agent is not None:
             return self._agent
         builder = StateGraph(ThreadState, context_schema=GraphContext)  # type: ignore
-        
+        builder.add_node("summarization_node",cast(Any,summarization))
         builder.add_node("plan_model_node", cast(Any, plan_model_node), retry_policy=_PLAN_RETRY_POLICY)
         builder.add_node("step_dispatch_node", cast(Any, step_dispatch_node))
         builder.add_node("general_agent", cast(Any, general_agent))
 
-        builder.add_edge(START, "plan_model_node")
+        builder.add_edge(START, "summarization_node") # 先判断是否需要总结后再进入规划节点
+        builder.add_edge("summarization_node","plan_model_node")
 
         # 规划 → 已完成（最终答案）直接结束；有子任务走调度；无任务（澄清/直接回复）也结束
         builder.add_conditional_edges(
