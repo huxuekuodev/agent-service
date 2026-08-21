@@ -2,6 +2,7 @@
 import { ref, onMounted, nextTick } from 'vue'
 import Sidebar from './components/Sidebar.vue'
 import ChatArea from './components/ChatArea.vue'
+import MonitorView from './components/MonitorView.vue'
 import {
   createSession,
   listSessions,
@@ -16,6 +17,8 @@ const thinking = ref('')
 const streaming = ref(false)
 const sidebarOpen = ref(false)
 const error = ref('')
+const view = ref('chat') // chat | monitor
+const monitorRef = ref(null)
 
 const THINK = 'thinkMessage'
 
@@ -193,11 +196,20 @@ async function handleSend(text) {
 onMounted(() => {
   refreshSessions()
 })
+
+function switchView(v) {
+  view.value = v
+  if (v === 'monitor') {
+    // 切到监控页时刷新（组件与 token 汇总）
+    nextTick(() => monitorRef.value?.refreshAll?.())
+  }
+}
 </script>
 
 <template>
   <div class="layout">
     <Sidebar
+      v-if="view === 'chat'"
       :sessions="sessions"
       :current-id="currentId"
       :open="sidebarOpen"
@@ -208,20 +220,32 @@ onMounted(() => {
     />
 
     <!-- 手机端遮罩 -->
-    <div v-if="sidebarOpen" class="mask" @click="sidebarOpen = false" />
+    <div v-if="sidebarOpen && view === 'chat'" class="mask" @click="sidebarOpen = false" />
 
     <main class="main">
       <header class="topbar">
-        <button class="menu-btn" aria-label="菜单" @click="sidebarOpen = true">☰</button>
-        <span class="title">{{ titleOf(sessions.find((s) => s.id === currentId)) }}</span>
+        <button v-if="view === 'chat'" class="menu-btn" aria-label="菜单" @click="sidebarOpen = true">☰</button>
+        <div class="tabs">
+          <button :class="['tab', { active: view === 'chat' }]" @click="switchView('chat')">💬 对话</button>
+          <button :class="['tab', { active: view === 'monitor' }]" @click="switchView('monitor')">📈 监控</button>
+        </div>
+        <span v-if="view === 'chat'" class="title">{{ titleOf(sessions.find((s) => s.id === currentId)) }}</span>
       </header>
 
-      <ChatArea
-        :messages="messages"
-        :thinking="thinking"
-        :streaming="streaming"
-        @send="handleSend"
+      <MonitorView
+        v-if="view === 'monitor'"
+        ref="monitorRef"
+        :session-id="currentId"
       />
+
+      <template v-else>
+        <ChatArea
+          :messages="messages"
+          :thinking="thinking"
+          :streaming="streaming"
+          @send="handleSend"
+        />
+      </template>
 
       <div v-if="error" class="toast">{{ error }}</div>
     </main>
@@ -250,6 +274,28 @@ onMounted(() => {
   padding: 0 14px;
   border-bottom: 1px solid var(--border);
   background: var(--panel);
+}
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  background: #eef0f3;
+  border-radius: 10px;
+  padding: 3px;
+}
+
+.tab {
+  padding: 5px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--text-2);
+}
+
+.tab.active {
+  background: var(--panel);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: var(--shadow);
 }
 
 .menu-btn {

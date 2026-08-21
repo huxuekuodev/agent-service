@@ -329,11 +329,27 @@ async def maybe_evaluate_general(
             tools_desc=tools_desc,
             current_time=current_time,
         )
-        await evaluator.evaluate(
+        result = await evaluator.evaluate(
             trace_id=trace_id,
             prompt_input=evaluator.build_prompt_input(eval_input),
             messages=messages,
             config=config,
         )
+        # 评估结果打点（page=evaluation，p0=评估器, p1=指标, p2=得分, p3=passed）
+        if result is not None and result.scores:
+            from app.core.tracking import TrackingPage, TrackingType
+            from app.core.tracking.tracker import track
+
+            role = eval_settings.model or ""
+            for metric, score in result.scores.items():
+                await track(
+                    TrackingType.EVALUATION,
+                    TrackingPage.EVALUATION,
+                    model=role,
+                    p0="GeneralEvaluator",
+                    p1=metric,
+                    p2=str(score),
+                    p3=str(result.passed).lower(),
+                )
     except Exception as exc:
         logger.warning("General evaluation skipped: %s", exc)

@@ -340,7 +340,7 @@ class YuqueClient:
 
 
 async def main() -> None:
-    from datetime import datetime
+    from datetime import datetime, timedelta
 
     from dotenv import load_dotenv
 
@@ -363,21 +363,25 @@ async def main() -> None:
             dt_local = dt_utc.astimezone()
             dt_local_date = dt_local.date()
             today_local = now_local.date()
-            yesterday_local = today_local.replace(day=today_local.day - 1)
+            yesterday_local = today_local.replace(day=today_local.day - 2)
             if yesterday_local == dt_local_date:
                 print(f"{rep.name}昨天更新过")
                 ns = rep.namespace
                 docs, _ = await client.list_docs(ns)
                 for doc in docs:
                     doc_utc = datetime.fromisoformat(doc.updated_at.replace("Z", "+00:00"))
-                    doc_local = doc_utc.astimezone()
+                    doc_local: datetime = doc_utc.astimezone()
                     doc_local_date = doc_local.date()
-                    if doc_local_date == yesterday_local:
+
+                    new_doc = doc_local_date + timedelta(days=14)
+                    if new_doc == yesterday_local:
                         print(f"知识库 {rep.name} 中 【{doc.title}】昨天更新了")
                         if not docs:
                             return
-                        doc_n = await client.get_document(ns, doc.slug)
-                        print(f"标题：{doc.title}\n正文预览：{doc_n.content_md[:200]}")
+                        doc_list = await client.list_doc_versions(doc.id)
+                        print(f"历史长度:{len(doc_list)}")
+                        # doc_n = await client.get_document(ns, doc.slug)
+                        # print(f"标题：{doc.title}\n正文预览：{doc_n.content_md[:200]}")
     finally:
         await client.aclose()
 

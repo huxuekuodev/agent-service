@@ -9,6 +9,7 @@
 """
 
 import asyncio
+import datetime as dt
 
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage
@@ -22,6 +23,8 @@ from app.agents.thread_state import ThreadState
 from app.agents.tools import describe_execute_tools_v2, get_execute_tools
 from app.core.context import trace_id_ctx_var
 from app.core.log import logger
+from app.core.tracking import TrackingPage, TrackingType
+from app.core.tracking.tracker import track
 from app.llm import create_llm_with_name
 
 
@@ -77,10 +80,24 @@ async def general_agent(state: ThreadState, config: RunnableConfig, runtime: Run
     llm = create_llm_with_name(config, model_name="general_node_model")
     # create_agent 的 tools 参数会在内部自动 bind_tools，无需手动绑定
     agent = create_agent(model=llm, tools=await get_execute_tools(), system_prompt=system_prompt, name="general_node_agent")
-    agent_result = await agent.ainvoke(
-        {"messages": [HumanMessage(content=task_info)]},
-        config=config,
-    )
+
+    # 执行节点埋点：step_start / step_complete（p0=plan_id, p1=任务名, p2=状态, p3=耗时ms）
+    role = "general_node_model"
+    start = dt.datetime.now().astimezone()
+    await track(TrackingType.STEP_START, TrackingPage.EXECUTE, model=role, p0=plan_id, p1=task_name[:100])
+    try:
+        agent_result = await agent.ainvoke(
+            {"messages": [HumanMessage(content=task_info)]},
+            config=config,
+        )
+        status = "completed"
+    except Exception:
+        status = "failed"
+        raise
+    finally:
+        duration_ms = int((dt.datetime.now().astimezone() - start).total_seconds() * 1000)
+        await track(TrackingType.STEP_COMPLETE, TrackingPage.EXECUTE, model=role, p0=plan_id, p1=task_name[:100], p2=status, p3=str(duration_ms))
+
     agent_msgs = agent_result.get("messages", [])
     final_msg = agent_msgs[-1] if agent_msgs else AIMessage(content="")
     task_result = final_msg.content if hasattr(final_msg, "content") else str(final_msg)

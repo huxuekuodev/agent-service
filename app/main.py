@@ -27,6 +27,8 @@ load_dotenv()
 
 from app.core.log import logger  # noqa: E402
 from app.core.response import BAD_REQUEST, INTERNAL_ERROR, NOT_FOUND, BizError, err  # noqa: E402
+from app.monitor import store as monitor_store  # noqa: E402
+from app.monitor.router import router as monitor_router  # noqa: E402
 from app.routers import health, knowledge, sessions  # noqa: E402
 
 
@@ -61,13 +63,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     try:
         yield
     finally:
-        # 释放资源（关闭 postgres 连接池 + 摄取服务）
+        # 释放资源（关闭 postgres 连接池 + 摄取服务 + 监控存储）
         await service.__aexit__(None, None, None)
         if ingest_service is not None:
             try:
                 await ingest_service.aclose()
             except Exception as exc:
                 logger.warning("知识库摄取服务关闭异常: {}", exc)
+        try:
+            await monitor_store.aclose()
+        except Exception as exc:
+            logger.warning("监控存储关闭异常: {}", exc)
         logger.info("Deer Agent Service 关闭，AgentService 已释放")
 
 
@@ -94,6 +100,7 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(sessions.router)
 app.include_router(knowledge.router)
+app.include_router(monitor_router)
 
 
 # ---------------------------------------------------------------------------

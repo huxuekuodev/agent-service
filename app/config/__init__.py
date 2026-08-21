@@ -232,6 +232,55 @@ class LoggingConfig:
 
 
 @dataclass
+class TrackingConfig:
+    """打点（tracking）配置：独立数据日志，不写入执行日志（app.log）。"""
+
+    output: str = "logs/tracking.data"
+    """数据日志文件路径；每行一条打点（ISO 时间 + base64(protobuf)），供后续数据链路消费。"""
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> TrackingConfig:
+        d = d or {}
+        return cls(output=str(d.get("output", "logs/tracking.data")) or "logs/tracking.data")
+
+
+@dataclass
+class ModelTokenPrice:
+    """单个模型的 token 单价（元 / 1K tokens）。"""
+
+    input_price: float = 0.0
+    """输入 token 单价（元 / 1K）。"""
+    output_price: float = 0.0
+    """输出 token 单价（元 / 1K）。"""
+
+
+@dataclass
+class TokenPricingConfig:
+    """Token 计费配置（config.yaml ``token_pricing``）。
+
+    按模型角色名（``models`` 段 key）配置输入/输出单价；未配置的模型按 0 计费。
+    """
+
+    prices: dict[str, ModelTokenPrice] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> TokenPricingConfig:
+        d = d or {}
+        prices: dict[str, ModelTokenPrice] = {}
+        for model, price in d.items():
+            if isinstance(price, dict):
+                prices[str(model)] = ModelTokenPrice(
+                    input_price=float(price.get("input_price", 0.0) or 0.0),
+                    output_price=float(price.get("output_price", 0.0) or 0.0),
+                )
+        return cls(prices=prices)
+
+    def price_of(self, model: str) -> ModelTokenPrice:
+        """取某模型角色的单价（未配置返回 0 价）。"""
+        return self.prices.get(model, ModelTokenPrice())
+
+
+@dataclass
 class DatabaseConfig:
     """数据库配置（checkpointer 共享存储）。"""
 
@@ -370,6 +419,12 @@ class AppConfig:
     log_level: str = "INFO"
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
+    # 打点（独立数据日志，不写入执行日志 app.log）
+    tracking: TrackingConfig = field(default_factory=TrackingConfig)
+
+    # Token 计费（可选）：按模型角色配置输入/输出单价（元 / 1K tokens）
+    token_pricing: TokenPricingConfig = field(default_factory=TokenPricingConfig)
+
     models: dict[str, str] = field(default_factory=dict)
     """模型角色 → LLM 实例名（见 app/llm/instances/，每个实例只配置一套）。"""
 
@@ -425,6 +480,8 @@ class AppConfig:
             config_version=int(data.get("config_version", 1)),
             log_level=str(data.get("log_level", "INFO")).upper(),
             logging=LoggingConfig.from_dict(data.get("logging")),
+            tracking=TrackingConfig.from_dict(data.get("tracking")),
+            token_pricing=TokenPricingConfig.from_dict(data.get("token_pricing")),
             models=models,
             langfuse=LangfuseConfig.from_dict(data.get("langfuse")),
             plan_evaluation=PlanEvaluationSettings.from_dict(data.get("plan_evaluation")),

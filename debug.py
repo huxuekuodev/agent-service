@@ -25,6 +25,7 @@ from app.config import get_app_config
 from app.core.context import trace_id_ctx_var
 from app.core.log import logger
 from app.core.runtime import RunContext
+from app.core.tracking import TrackingExt, tracker
 
 
 class StreamPrinter:
@@ -179,6 +180,7 @@ async def main():
         thread_id = "debug-thread-001"
 
         # 使用成熟的消息打印器
+        await tracker.track("text",page="text",ext=TrackingExt(p0="1"))
         printer = StreamPrinter()
         async for chunk in agent.astream(state, thread_id=thread_id, trace_id=trace_id):
             printer.handle_chunk(chunk)

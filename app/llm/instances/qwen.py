@@ -44,7 +44,7 @@ register(
         name="siliconflow_qwen",
         display_name="硅基流动千问",
         use="langchain_openai:ChatOpenAI",
-        model="Qwen/Qwen3-8B",
+        model="Qwen/Qwen3-14B",
         # model="Qwen/Qwen3-14B", # R1蒸馏款
         api_key_env="SILICONFLOW_KEY",
         base_url=_SILICONFLOW_BASE_URL,

@@ -18,8 +18,7 @@ import asyncio
 from typing import Any, cast
 
 from langchain.agents import create_agent
-from langchain_core.messages import (AIMessage, BaseMessage, HumanMessage,
-                                     ToolMessage)
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langfuse import Langfuse
 from langgraph.config import get_stream_writer
@@ -29,18 +28,17 @@ from pydantic import BaseModel, Field
 
 from app.agents.current_time import has_current_time_for_today
 from app.agents.errors import build_error_fallback_message, classify_llm_error
-from app.agents.evaluation.plan_evaluator import (EvaluationInput,
-                                                  maybe_evaluate_plan)
+from app.agents.evaluation.plan_evaluator import EvaluationInput, maybe_evaluate_plan
 from app.agents.lead_agent import GraphContext
-from app.agents.middlewares.clarification_middleware import \
-    ClarificationMiddleware
-from app.agents.middlewares.dangling_tool_call_middleware import \
-    DanglingToolCallMiddleware
+from app.agents.middlewares.clarification_middleware import ClarificationMiddleware
+from app.agents.middlewares.dangling_tool_call_middleware import DanglingToolCallMiddleware
 from app.agents.nodes.constants import THINK_MES
 from app.agents.subtask import SubTask
 from app.agents.thread_state import ThreadState
 from app.core.context import trace_id_ctx_var
 from app.core.log import logger
+from app.core.tracking import TrackingPage, TrackingType
+from app.core.tracking.tracker import track
 from app.llm import create_llm_with_name
 
 
@@ -181,12 +179,16 @@ async def plan_model_node(state: ThreadState, config: RunnableConfig, runtime: R
         # 澄清问题以 AIMessage 直接回复用户（替换中间的 [tool-call AIMessage + ToolMessage]）。
         if has_clarification:
             writer({"type": THINK_MES, "messages": "📋 需要澄清需求", "trace_id": trace_id})
-            return {"messages": _clean_clarification_messages(agent_msgs), "completed": True}
+            clean_msgs = _clean_clarification_messages(agent_msgs)
+            question = str(clean_msgs[-1].content)[:200] if clean_msgs else ""
+            await track(TrackingType.CLARIFY, TrackingPage.PLAN, model=_request_model(config), p4=question)
+            return {"messages": clean_msgs, "completed": True}
 
         # 反思通过：action=complete 且有最终答案 → 作为 AIMessage 追加到 messages 作为回复
         if plan_output and plan_output.action == "complete" and plan_output.answer:
             answer_msg = AIMessage(content=plan_output.answer)
             writer({"type": THINK_MES, "messages": "📋 反思通过，生成最终答案", "trace_id": trace_id})
+            await track(TrackingType.PLAN_COMPLETE, TrackingPage.PLAN, model=_request_model(config), p2="complete", p4=plan_output.answer[:200])
             # 反思通过后，清空旧计划（若有）。
             return {"messages": [answer_msg], "completed": True, "plan_tasks": Overwrite(value=[])}
 
@@ -205,8 +207,10 @@ async def plan_model_node(state: ThreadState, config: RunnableConfig, runtime: R
             # 提示词约束：create 仅用于「新问题与旧计划不一致」或「无旧计划」时，
             # 此时旧任务应全部废弃，用 Overwrite 绕过 merge reducer 整体替换。
             if plan_output.action == "create":
+                await track(TrackingType.PLAN_CREATE, TrackingPage.PLAN, model=_request_model(config), p1=str(len(subtasks)), p2="create")
                 return {"messages": agent_msgs, "plan_tasks": Overwrite(value=subtasks)}
             # action=update：合并到现有计划，保留旧任务
+            await track(TrackingType.PLAN_UPDATE, TrackingPage.PLAN, model=_request_model(config), p1=str(len(subtasks)), p2="update")
             return {"messages": agent_msgs, "plan_tasks": subtasks}
 
         # 模型直接给出了最终答案（answer 非空）但没有子任务：
@@ -295,6 +299,11 @@ def _try_parse_plan(msg: AIMessage) -> PlanOutput | None:
 # ----------------------------------------------------------------------
 # 澄清消息清理
 # ----------------------------------------------------------------------
+
+
+def _request_model(config: RunnableConfig) -> str:
+    """从运行配置取本次请求的模型角色名（打点 model 字段）。"""
+    return str((config.get("configurable") or {}).get("model_name") or "")
 
 
 def _clean_clarification_messages(agent_msgs: list[BaseMessage]) -> list[BaseMessage]:

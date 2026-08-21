@@ -4,6 +4,18 @@ logging:
   level: INFO
   file:
 
+# 打点（tracking）：独立数据日志，不写入执行日志 app.log。
+# 每行一条打点：{ISO 时间} {base64(protobuf)}，供后续接入 Kafka/数仓等数据链路。
+tracking:
+  output: logs/tracking.data
+
+# Token 计费（可选）：按模型角色（models 段 key）配置输入/输出单价（元 / 1K tokens）。
+# 未配置的模型按 0 计费；token 统计不受影响，只影响费用字段。
+token_pricing:
+  default:
+    input_price: 0.002
+    output_price: 0.008
+
 # 模型角色 → LLM 实例名（app/llm/instances/ 中注册的实例；每个实例只配置一套，
 # 模型类 / 模型名 / API Key 环境变量 / 端点 / 超时等都在实例里定义）。
 # 换渠道或换 key：新增一个实例文件并把角色指向它即可，无需重复配置。

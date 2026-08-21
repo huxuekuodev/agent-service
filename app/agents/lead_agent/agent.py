@@ -12,6 +12,7 @@ step_fan_out_router 是路由函数（不是节点），由 add_conditional_edge
   这样多节点负载均衡下，用户请求发散到任意节点都不会丢会话上下文。
 """
 
+import datetime as dt
 from typing import Any, cast
 
 from langchain_core.runnables import RunnableConfig
@@ -23,13 +24,16 @@ from langgraph.types import RetryPolicy
 
 from app.agents.errors import should_retry
 from app.agents.lead_agent import GraphContext
-from app.agents.nodes import (plan_model_node, step_dispatch_node,
-                              step_fan_out_router, summarization)
+from app.agents.nodes import plan_model_node, step_dispatch_node, step_fan_out_router, summarization
 from app.agents.nodes.general_agent import general_agent
 from app.agents.plan_storage import get_plan_storage
 from app.agents.thread_state import ThreadState
 from app.config import get_app_config
+from app.core.log import logger
 from app.core.runtime import RunContext
+from app.core.token import compute_token_cost
+from app.core.tracking import TrackingPage, TrackingSource, TrackingType
+from app.core.tracking.tracker import track
 from app.llm import create_llm
 
 # 规划节点重试策略：仅对可恢复的 LLM 错误重试（超时/连接/5xx/429/服务繁忙），
@@ -41,6 +45,31 @@ _PLAN_RETRY_POLICY = RetryPolicy(
     backoff_factor=2.0,  # 指数退避：0.5 → 1 → 2s
     jitter=True,  # 加随机抖动防惊群
 )
+
+
+def _extract_chunk_usage(st: Any) -> tuple[int, int]:
+    """从流式 chunk 中提取 token 用量（input, output）。
+
+    兼容 StreamPart dict（{"type": "messages", "data": (chunk, metadata)}）
+    与旧版元组形态；chunk 为 AIMessageChunk，usage_metadata 通常只出现在
+    每条消息的最后一个 chunk 上（不同 provider 字段名略有差异）。
+    """
+    mode = None
+    data = None
+    if isinstance(st, dict):
+        mode = st.get("type")
+        data = st.get("data")
+    elif isinstance(st, (tuple, list)) and len(st) == 2:
+        mode, data = st
+    if mode != "messages" or not isinstance(data, (tuple, list)) or not data:
+        return 0, 0
+    chunk = data[0]
+    usage = getattr(chunk, "usage_metadata", None)
+    if not isinstance(usage, dict):
+        return 0, 0
+    inp = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+    out = usage.get("output_tokens") or usage.get("completion_tokens") or 0
+    return int(inp or 0), int(out or 0)
 
 
 class GraphAgent:
@@ -59,13 +88,13 @@ class GraphAgent:
         if self._agent is not None:
             return self._agent
         builder = StateGraph(ThreadState, context_schema=GraphContext)  # type: ignore
-        builder.add_node("summarization_node",cast(Any,summarization))
+        builder.add_node("summarization_node", cast(Any, summarization))
         builder.add_node("plan_model_node", cast(Any, plan_model_node), retry_policy=_PLAN_RETRY_POLICY)
         builder.add_node("step_dispatch_node", cast(Any, step_dispatch_node))
         builder.add_node("general_agent", cast(Any, general_agent))
 
-        builder.add_edge(START, "summarization_node") # 先判断是否需要总结后再进入规划节点
-        builder.add_edge("summarization_node","plan_model_node")
+        builder.add_edge(START, "summarization_node")  # 先判断是否需要总结后再进入规划节点
+        builder.add_edge("summarization_node", "plan_model_node")
 
         # 规划 → 已完成（最终答案）直接结束；有子任务走调度；无任务（澄清/直接回复）也结束
         builder.add_conditional_edges(
@@ -134,15 +163,64 @@ class GraphAgent:
         config: RunnableConfig = {"configurable": configurable}
         config["callbacks"] = [CallbackHandler(trace_context=TraceContext(trace_id=trace_id or ""))]
 
-        async for st in agent.astream(
-            stream_mode=["values", "messages", "custom"],
-            input=input_data,
-            config=config,
-            context=ctx,
-            version="v2",
-            subgraphs=True,
-        ):
-            yield st
+        # 本次请求使用的模型角色（打点 model 字段 + token 计费按它区分）
+        role = model_name or self._app_config.default_model_name
+
+        start: dt.datetime = dt.datetime.now().astimezone()
+        input_tokens = 0
+        output_tokens = 0
+        try:
+            async for st in agent.astream(
+                stream_mode=["values", "messages", "custom"],
+                input=input_data,
+                config=config,
+                context=ctx,
+                version="v2",
+                subgraphs=True,
+            ):
+                yield st
+                # 累计 token 用量：messages 流中 AIMessageChunk 的 usage_metadata
+                inp, out = _extract_chunk_usage(st)
+                input_tokens += inp
+                output_tokens += out
+        finally:
+            # 每次请求【只打一次】完整耗时与 token 消耗（在循环外执行，无论流是否完整/中断）
+            duration_ms = int((dt.datetime.now().astimezone() - start).total_seconds() * 1000)
+            await track(
+                type_=TrackingType.JOIN,
+                page=TrackingPage.CALL_MODEL,
+                source=TrackingSource.SERVER,
+                model=role,
+                p0=str(duration_ms),
+            )
+            total_tokens = input_tokens + output_tokens
+            if total_tokens > 0:
+                cost = compute_token_cost(role, input_tokens, output_tokens)
+                await track(
+                    type_=TrackingType.TOKEN_USAGE,
+                    page=TrackingPage.TOKEN,
+                    source=TrackingSource.SERVER,
+                    model=role,
+                    p0=str(total_tokens),
+                    p1=str(input_tokens),
+                    p2=str(output_tokens),
+                    p3=str(cost),
+                )
+                # 用户累计 token 消耗（当前以 session_id 代指用户，接入登录后换成真实 user_id）
+                try:
+                    from app.monitor import store as monitor_store
+
+                    if monitor_store.is_available():
+                        await monitor_store.upsert_user_token_usage(
+                            user_id=thread_id,
+                            model=role,
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            total_tokens=total_tokens,
+                            cost=cost,
+                        )
+                except Exception as exc:
+                    logger.warning("用户 token 汇总写入失败: {}", exc)
 
     def get_context(self, model_name: str | None = None) -> GraphContext:
         config: RunnableConfig = {"configurable": {"model_name": model_name or self._app_config.default_model_name}}

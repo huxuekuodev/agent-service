@@ -49,7 +49,8 @@ agent-service/
     │   ├── context.py        # 请求级 trace_id（ContextVar）
     │   ├── log.py            # loguru 配置（trace_id 注入日志格式）
     │   ├── reflection.py     # 动态模块/类加载（resolve_class / resolve_variable）
-    │   └── runtime.py        # RunContext（注入 checkpointer / app_config 到图运行时）
+    │   ├── runtime.py        # RunContext（注入 checkpointer / app_config 到图运行时）
+    │   └── tracking/         # 打点工具包：protobuf 编/解码 + 独立数据日志（constants/model/encoder/decoder/tracker/tracking.proto/__main__，见 docs/打点设计.md）
     ├── llm/                  # 大模型渠道管理（每个渠道一个实例，只配置一套；所有 LLM 操作在此）
     │   ├── base.py           # LLMInstance 数据类 + 注册表（register / get / list）
     │   ├── factory.py        # create_chat_model：按角色名→实例构建 ChatModel
@@ -91,6 +92,9 @@ agent-service/
     ├── routers/
     │   ├── sessions.py       # 会话与对话接口（创建/列表/删除/chat SSE/chat sync）
     │   └── health.py         # 健康检查
+    ├── monitor/              # 监控平台后端（/monitor/*）：组件配置/字段含义/用户token（PG）+
+    │   │                     # 打点数据聚合查询（store.py / query.py / router.py）
+    │   └── (web/src/components/MonitorView.vue + MonitorChart.vue 监控页)
     └── prompts/
         ├── plan_system_prompt_v2.md      # 规划节点系统提示词
         ├── general_agent_system_prompt.md # 通用执行 agent 系统提示词
@@ -100,8 +104,14 @@ agent-service/
 
 ## 配置入口
 
-`config.yaml` 是唯一配置源（路径优先级：显式 `config_path` > `AGENT_CONFIG_PATH` > `./config.yaml`），支持 `$ENV` 变量引用 `.env` 中的密钥。关键段：`models`（模型角色 → LLM 实例名映射，实例见 `app/llm/instances/`，每个实例只配置一套）、`langfuse`（追踪开关）、`plan_evaluation`（旧评估配置，向后兼容）、`evaluators`（推荐的可插拔评估器列表）、`subagents`、`database`（`memory` / `postgres`）。
+`config.yaml` 是唯一配置源（路径优先级：显式 `config_path` > `AGENT_CONFIG_PATH` > `./config.yaml`），支持 `$ENV` 变量引用 `.env` 中的密钥。关键段：`models`（模型角色 → LLM 实例名映射，实例见 `app/llm/instances/`，每个实例只配置一套）、`langfuse`（追踪开关）、`tracking`（打点独立数据日志，默认 `logs/tracking.data`，不写入 app.log）、`token_pricing`（Token 计费：模型角色 → 输入/输出单价，元 / 1K tokens）、`plan_evaluation`（旧评估配置，向后兼容）、`evaluators`（推荐的可插拔评估器列表）、`subagents`、`database`（`memory` / `postgres`）。
 
+
+## 快速启动（Makefile）
+
+- `make dev`：同时启动后端（http://127.0.0.1:8001，uvicorn --reload）与 Web（http://127.0.0.1:5173，vite dev，`/sessions /monitor /health /knowledge` 代理到后端），Ctrl-C 一键全部停止
+- `make dev-api` / `make dev-web`：分别启动后端 / Web
+- `make lint`（ruff check + format --check）/ `make test`（pytest）/ `make build-web`（vite build）/ `make clean`（清理缓存）
 
 ## 项目规则
 - 当创建新的配置项时，确保`config.yaml` 和 `config.example.yaml` 都有对应的更新。

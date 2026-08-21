@@ -1,0 +1,38 @@
+// 打点数据结构（app/core/tracking）。
+// 与 docs/打点设计.md 保持一致；字段编号发布后不可变更（protobuf 兼容性约束）。
+//
+// 数据日志（config.yaml tracking.output）每行一条：{ISO 时间} {base64(Content bytes)}。
+// 可用 protoc 解码单条：
+//   echo "<base64>" | base64 -d | protoc --decode=tracking.Content tracking.proto
+
+syntax = "proto3";
+
+package tracking;
+
+// 打点内容
+message Content {
+  string type   = 1;  // 打点类型（TrackingType）
+  string page   = 2;  // 业务名称（TrackingPage）
+  string source = 3;  // 来源（TrackingSource）
+  Ext    ext    = 4;  // 点位信息（按 page 分配含义）
+  string model  = 5;  // 模型角色名（监控按 model 分组/对比）
+}
+
+// 点位信息：P0-P14，共 15 个字符串槽位，按业务名称（page）分配不同含义
+message Ext {
+  string p0  = 1;
+  string p1  = 2;
+  string p2  = 3;
+  string p3  = 4;
+  string p4  = 5;
+  string p5  = 6;
+  string p6  = 7;
+  string p7  = 8;
+  string p8  = 9;
+  string p9  = 10;
+  string p10 = 11;
+  string p11 = 12;
+  string p12 = 13;
+  string p13 = 14;
+  string p14 = 15;
+}

@@ -8,9 +8,10 @@
  */
 
 const BASE = '/sessions'
+const MONITOR = '/monitor'
 
-async function request(path, options = {}) {
-  const res = await fetch(`${BASE}${path}`, {
+async function request(path, options = {}, base = BASE) {
+  const res = await fetch(`${base}${path}`, {
     headers: { 'Content-Type': 'application/json' },
     ...options,
   })
@@ -128,4 +129,72 @@ export async function chatStream(sessionId, message, { onEvent, onError, onFinal
   } finally {
     onFinally?.()
   }
+}
+
+// ---------------------------------------------------------------------------
+// 监控（/monitor/*）
+// ---------------------------------------------------------------------------
+
+/** 可用业务名称列表（含默认槽位含义） */
+export function monitorGetPages() {
+  return request('', {}, MONITOR).then((d) => d?.pages ?? [])
+}
+
+/** 数据日志中出现过的模型 */
+export function monitorGetModels() {
+  return request('/models', {}, MONITOR).then((d) => d?.models ?? [])
+}
+
+/** 某 page 的 Ext 槽位含义 */
+export function monitorGetFieldMeanings(page) {
+  return request(`/field-meanings?page=${encodeURIComponent(page)}`, {}, MONITOR).then(
+    (d) => d?.meanings ?? []
+  )
+}
+
+/** 保存某 page 的 Ext 槽位含义 */
+export function monitorPutFieldMeanings(page, meanings) {
+  return request('/field-meanings', {
+    method: 'PUT',
+    body: JSON.stringify({ page, meanings }),
+  }, MONITOR)
+}
+
+/** 监控组件列表 */
+export function monitorListComponents() {
+  return request('/components', {}, MONITOR).then((d) => d?.components ?? [])
+}
+
+/** 创建监控组件 */
+export function monitorCreateComponent(cfg) {
+  return request('/components', { method: 'POST', body: JSON.stringify(cfg) }, MONITOR)
+}
+
+/** 更新监控组件 */
+export function monitorUpdateComponent(id, cfg) {
+  return request(`/components/${id}`, { method: 'PUT', body: JSON.stringify(cfg) }, MONITOR)
+}
+
+/** 删除监控组件 */
+export function monitorDeleteComponent(id) {
+  return request(`/components/${id}`, { method: 'DELETE' }, MONITOR)
+}
+
+/**
+ * 打点数据聚合查询
+ * @param {Object} p - page/metric/model/start/end/granularity/stat/group
+ */
+export function monitorQuery(p) {
+  const qs = new URLSearchParams()
+  for (const [k, v] of Object.entries(p)) {
+    if (v !== undefined && v !== null && v !== '') qs.set(k, v)
+  }
+  return request(`/query?${qs.toString()}`, {}, MONITOR)
+}
+
+/** 用户 token 消耗汇总（按模型） */
+export function monitorTokenUsage(userId) {
+  return request(`/token-usage?user_id=${encodeURIComponent(userId)}`, {}, MONITOR).then(
+    (d) => d?.usage ?? []
+  )
 }
