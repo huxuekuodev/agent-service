@@ -36,7 +36,9 @@ agent-service/
 ├── ruff.toml                 # ruff 配置
 ├── debug.py                  # 调试入口：直接运行可断点调试完整图流程
 ├── docs/
-│   └── RAG_方案.md           # RAG 方案设计文档
+│   ├── RAG_方案.md           # RAG 方案设计文档
+│   └── SKILL_方案.md         # SKILL（标准 SOP + 沙箱执行 + 人工介入）设计文档
+├── skills/                   # 技能仓库：每子目录一个 skill（SKILL.md/SOP.md/errors.yaml/cleanup.yaml/scripts）
 ├── tests/                    # 测试（当前基本为空）
 └── app/                      # 主代码
     ├── main.py               # FastAPI 入口；lifespan 管理 AgentService 生命周期
@@ -62,8 +64,9 @@ agent-service/
     │   ├── plan_document.py  # Plan DAG 数据模型（v1 遗留，StepStatus 等）
     │   ├── plan_storage.py   # Plan 存储抽象（内存/Redis 后端，v1 遗留）
     │   ├── plan_toolkit.py   # Plan 工具集 v2：create/update/get_plan_status（ContextVar 桥接）
+    │   ├── skills/           # SKILL 能力：标准 SOP 技能库（registry/loader/sandbox/tools，见 docs/SKILL_方案.md）
     │   ├── tools/            # 工具注册表（包）：按业务分类组织第三方工具
-    │   │   ├── __init__.py   # 对外 API：get_plan_tools / get_execute_tools / describe_execute_tools
+    │   │   ├── __init__.py   # 对外 API：get_plan_tools / get_execute_tools（自动追加技能工具链）等
     │   │   ├── registry.py   # 从 config `tools` 段加载工具类，按 allowed_agents 过滤
     │   │   ├── builtin.py    # 内置工具：ask_clarification（澄清）
     │   │   ├── web/          # 联网类工具（web_search，基于 Tavily API）
@@ -104,7 +107,7 @@ agent-service/
 
 ## 配置入口
 
-`config.yaml` 是唯一配置源（路径优先级：显式 `config_path` > `AGENT_CONFIG_PATH` > `./config.yaml`），支持 `$ENV` 变量引用 `.env` 中的密钥。关键段：`models`（模型角色 → LLM 实例名映射，实例见 `app/llm/instances/`，每个实例只配置一套）、`langfuse`（追踪开关）、`tracking`（打点独立数据日志，默认 `logs/tracking.data`，不写入 app.log）、`token_pricing`（Token 计费：模型角色 → 输入/输出单价，元 / 1K tokens）、`plan_evaluation`（旧评估配置，向后兼容）、`evaluators`（推荐的可插拔评估器列表）、`subagents`、`database`（`memory` / `postgres`）。
+`config.yaml` 是唯一配置源（路径优先级：显式 `config_path` > `AGENT_CONFIG_PATH` > `./config.yaml`），支持 `$ENV` 变量引用 `.env` 中的密钥。关键段：`models`（模型角色 → LLM 实例名映射，实例见 `app/llm/instances/`，每个实例只配置一套）、`langfuse`（追踪开关）、`tracking`（打点独立数据日志，默认 `logs/tracking.data`，不写入 app.log）、`token_pricing`（Token 计费：模型角色 → 输入/输出单价，元 / 1K tokens）、`skills`（技能库目录 + `enabled` 总开关 + E2B 沙箱执行配置，见 docs/SKILL_方案.md）、`plan_evaluation`（旧评估配置，向后兼容）、`evaluators`（推荐的可插拔评估器列表）、`subagents`、`database`（`memory` / `postgres`）。
 
 
 ## 快速启动（Makefile）
@@ -112,6 +115,7 @@ agent-service/
 - `make dev`：同时启动后端（http://127.0.0.1:8001，uvicorn --reload）与 Web（http://127.0.0.1:5173，vite dev，`/sessions /monitor /health /knowledge` 代理到后端），Ctrl-C 一键全部停止
 - `make dev-api` / `make dev-web`：分别启动后端 / Web
 - `make lint`（ruff check + format --check）/ `make test`（pytest）/ `make build-web`（vite build）/ `make clean`（清理缓存）
+- 启用 SKILL 沙箱前需在宿主机安装可选依赖并配置（见 docs/SKILL_方案.md）：`uv sync --extra sandbox`
 
 ## 项目规则
 - 当创建新的配置项时，确保`config.yaml` 和 `config.example.yaml` 都有对应的更新。

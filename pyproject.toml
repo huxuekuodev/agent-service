@@ -22,6 +22,7 @@ dependencies = [
     "httpx>=0.28.0",
     "python-dotenv>=1.0.0",
     "python-dateutil>=2.8.2",
+    "e2b-code-interpreter>=1.5.2",
 ]
 
 [project.optional-dependencies]
@@ -29,6 +30,10 @@ dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=1.3.0",
     "ruff>=0.14.11",
+]
+# skill 自带脚本的沙箱执行（E2B）；未安装时沙箱功能不可用，工具/框架其余部分不受影响
+sandbox = [
+    "e2b-code-interpreter>=1.0,<2",
 ]
 
 [dependency-groups]

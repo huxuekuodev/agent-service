@@ -17,6 +17,7 @@ config.yaml 中的 ``tools`` 段声明每个工具：name / use（类 import 路
 
 plan 阶段只有 ask_clarification 工具；execute 阶段工具由配置的工具清单加载，
 并按调用方 agent 名过滤（``allowed_agents`` 为空表示所有 agent 可用）。
+执行阶段还会追加技能工具链（app/agents/skills/tools.py，skills 仓库驱动）。
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from typing import Any
 
 from langchain.tools import BaseTool
 
+from app.agents.skills.tools import make_skill_tools
 from app.agents.tools.builtin import ask_clarification_tool
 from app.agents.tools.registry import load_config_tools
 
@@ -50,10 +52,18 @@ async def get_execute_tools(
 ) -> list[BaseTool]:
     """获取 execute 阶段可用的工具。
 
-    从 config.yaml ``tools`` 段加载，按 ``allowed_agents`` 过滤出当前 agent 可用的工具。
-    配置中无 ``tools`` 段时返回空列表（向后兼容）。
+    从 config.yaml ``tools`` 段加载，按 ``allowed_agents`` 过滤出当前 agent 可用的工具；
+    当 skills.enabled=true 时追加技能工具链（list_skills / load_skill / skill_step_detail /
+    run_skill_step / query_error），使执行 agent 能按标准 SOP（skills 仓库）工作。
+    关闭开关后不注入技能工具（对比「用/不用 skill」的 token 消耗）。
+    配置中无 ``tools`` 段时只返回技能工具链（向后兼容）。
     """
-    return load_config_tools(app_config=app_config, agent=agent)
+    config_tools = load_config_tools(app_config=app_config, agent=agent)
+    from app.agents.skills import is_skills_enabled
+
+    if not is_skills_enabled():
+        return config_tools
+    return [*config_tools, *make_skill_tools()]
 
 
 async def describe_execute_tools(*, app_config: Any = None) -> str:

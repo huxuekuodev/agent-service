@@ -112,8 +112,11 @@ def step_fan_out_router(state: ThreadState) -> list[Send] | str:
         return sends
 
     # 没有 in_progress 任务：
+    #   - 存在 failed → 回规划节点审查（按技能错误规则生成恢复 DAG / 人工介入 / 直接答复）
     #   - 全部完成 → 回到规划节点审查并给出最终答案
-    #   - 仍有阻塞/未完成任务 → 结束（避免死循环）
+    #   - 其他（阻塞/未完成）→ 结束（避免死循环）
+    if any(t.step_statuses == "failed" for t in plan_tasks):
+        return "plan_model_node"
     if all(t.step_statuses == "completed" for t in plan_tasks):
         return "plan_model_node"
 

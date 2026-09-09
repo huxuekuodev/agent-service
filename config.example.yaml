@@ -26,6 +26,21 @@ models:
   evaluate_model: deepseek
   # vision_model: qwen_vl    # 可选：知识库图片转文字（对应 ingest.vision_model 角色名）
 
+# SKILL 能力：标准 SOP 技能库（skills/ 目录）与 E2B 沙箱执行
+skills:
+  enabled: true            # 总开关：false 时禁用技能链路（不注入索引/skill_probe/技能工具）
+  dir: skills
+  cleanup_default: confirm   # 产物清理默认等级：auto / confirm / forbidden
+  max_candidates: 3          # 一次请求最多候选 skill 数
+  sandbox:
+    enabled: false           # skill 自带脚本在 E2B 沙箱内运行；需要 .env 配 E2B_API_KEY / E2B_DOMAIN / E2B_TEMPLATE
+    template:                # E2B 模板名；留空时读环境变量 E2B_TEMPLATE
+    timeout: 3600            # 沙箱最长存活秒数
+    command_timeout: 120     # 单条命令默认超时秒数
+    max_output_chars: 30000   # 单次执行输出回传 LLM 的最大字符数（0 = 不截断）
+    env_keys: [QWEATHER_API_KEY, QWEATHER_HOST]  # 允许注入沙箱的宿主环境变量白名单（key + 专属域名）
+    # exclude_patterns: [.env*, *.pem, *.key, ...]  # 同步时跳过的敏感文件（默认已内置）
+
 # 语雀数据源（知识库摄取）
 yuque:
   enabled: false

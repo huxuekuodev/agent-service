@@ -281,6 +281,78 @@ class TokenPricingConfig:
 
 
 @dataclass
+class SkillSandboxConfig:
+    """Skill 沙箱配置（config.yaml ``skills.sandbox``）。
+
+    三个 E2B 变量支持环境变量兜底（.env / 宿主环境）：
+      - ``E2B_TEMPLATE``：模板名（config 未填 template 时使用）
+      - ``E2B_API_KEY``：SDK 鉴权（SkillSandbox 创建时校验）
+      - ``E2B_DOMAIN``：自托管域名（SDK 自行读取）
+
+    仅当可选依赖 ``e2b-code-interpreter`` 已安装、template 非空、宿主环境存在 E2B_API_KEY
+    时沙箱可用。skill 自带的脚本在沙箱内运行，调用注册工具的步骤仍在本地执行。
+    """
+
+    enabled: bool = False
+    template: str = ""
+    """E2B 沙箱模板名（config 未填时读环境变量 E2B_TEMPLATE）。"""
+    timeout: int = 3600
+    """沙箱最长存活秒数。"""
+    command_timeout: int = 120
+    """单条命令默认超时秒数。"""
+    max_output_chars: int = 30000
+    """单次执行 stdout/stderr 回传给 LLM 的最大字符数（0 = 不截断）。"""
+    env_keys: list[str] = field(default_factory=list)
+    """允许从宿主环境注入沙箱的环境变量白名单（如 QWEATHER_API_KEY）。"""
+    exclude_patterns: list[str] = field(default_factory=lambda: [".env*", "*.pem", "*.key", "*.p12", ".git/*", "__pycache__/*", "*.pyc", ".venv/*", "node_modules/*"])
+    """同步 skill 目录到沙箱时跳过的敏感/无关文件（fnmatch 匹配相对路径）。"""
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> SkillSandboxConfig:
+        d = d or {}
+        template = str(d.get("template") or os.getenv("E2B_TEMPLATE", "") or "")
+        # enabled：config 显式给出则以其为准；未给出时若存在模板（config 或 E2B_TEMPLATE）则自动开启
+        explicit_enabled = d.get("enabled")
+        enabled = bool(explicit_enabled) if explicit_enabled is not None else bool(template)
+        return cls(
+            enabled=enabled,
+            template=template,
+            timeout=int(d.get("timeout", 3600)),
+            command_timeout=int(d.get("command_timeout", 120)),
+            max_output_chars=int(d.get("max_output_chars", 30000)),
+            env_keys=list(d.get("env_keys") or []),
+            exclude_patterns=list(d.get("exclude_patterns") or cls().exclude_patterns),
+        )
+
+
+@dataclass
+class SkillsConfig:
+    """SKILL 能力配置（config.yaml ``skills`` 段）。"""
+
+    enabled: bool = True
+    """总开关：关闭后规划节点不注入技能索引/不生成 skill_probe，执行 agent 不注入技能工具链
+    （用于对比「用/不用 skill」的 token 消耗与行为差异）。"""
+    dir: str = "skills"
+    """技能仓库目录（每子目录一个 skill，入口 SKILL.md）。"""
+    cleanup_default: str = "confirm"
+    """产物清理默认等级：auto / confirm / forbidden（人工介入用）。"""
+    max_candidates: int = 3
+    """一次请求最多候选 skill 数。"""
+    sandbox: SkillSandboxConfig = field(default_factory=SkillSandboxConfig)
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> SkillsConfig:
+        d = d or {}
+        return cls(
+            enabled=bool(d.get("enabled", True)),
+            dir=str(d.get("dir", "skills")) or "skills",
+            cleanup_default=str(d.get("cleanup_default", "confirm")) or "confirm",
+            max_candidates=int(d.get("max_candidates", 3)),
+            sandbox=SkillSandboxConfig.from_dict(d.get("sandbox")),
+        )
+
+
+@dataclass
 class DatabaseConfig:
     """数据库配置（checkpointer 共享存储）。"""
 
@@ -425,6 +497,9 @@ class AppConfig:
     # Token 计费（可选）：按模型角色配置输入/输出单价（元 / 1K tokens）
     token_pricing: TokenPricingConfig = field(default_factory=TokenPricingConfig)
 
+    # SKILL 能力（标准 SOP 技能库 + E2B 沙箱执行）
+    skills: SkillsConfig = field(default_factory=SkillsConfig)
+
     models: dict[str, str] = field(default_factory=dict)
     """模型角色 → LLM 实例名（见 app/llm/instances/，每个实例只配置一套）。"""
 
@@ -482,6 +557,7 @@ class AppConfig:
             logging=LoggingConfig.from_dict(data.get("logging")),
             tracking=TrackingConfig.from_dict(data.get("tracking")),
             token_pricing=TokenPricingConfig.from_dict(data.get("token_pricing")),
+            skills=SkillsConfig.from_dict(data.get("skills")),
             models=models,
             langfuse=LangfuseConfig.from_dict(data.get("langfuse")),
             plan_evaluation=PlanEvaluationSettings.from_dict(data.get("plan_evaluation")),

@@ -1,0 +1,13 @@
+errors:
+  - code: CITY_LOOKUP_FAILED
+    condition: get_city_code 输出 count=0 或 hint（未找到城市/省份）
+    action: retry
+    note: 检查省名/城市名拼写，改用其他写法（简称或全称）；仍失败则向用户澄清
+  - code: WEATHER_API_ERROR
+    condition: get_city_weather 退出非 0 或报 HTTP/业务错误码（401 无 Key / 404 城市编码不存在）
+    action: human
+    note: 城市编码不存在请回 step-01 重新取码；API Key 问题提示用户配置 QWEATHER_API_KEY
+  - code: SANDBOX_UNAVAILABLE
+    condition: E2B 沙箱不可用（缺 template / E2B_API_KEY / 未装可选依赖）
+    action: human
+    note: 提示配置 skills.sandbox（template + E2B_API_KEY + uv sync --extra sandbox）

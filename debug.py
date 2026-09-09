@@ -175,9 +175,9 @@ async def main():
         runcontext = RunContext(checkpointer=saver, app_config=app_config)
         # 无状态图：全局复用，thread_id 每次传入
         agent = GraphAgent(runcontext)
-        userquery = "查询北京的今天的天气"
+        userquery = "是的河北省主要城市的天气"
         state = {"messages": [HumanMessage(content=userquery)]}
-        thread_id = "debug-thread-001"
+        thread_id = "debug-thread-36"
 
         # 使用成熟的消息打印器
         await tracker.track("text",page="text",ext=TrackingExt(p0="1"))

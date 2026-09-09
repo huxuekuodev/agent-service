@@ -18,14 +18,20 @@ from langgraph.runtime import Runtime
 
 from app.agents.evaluation.general_evaluator import maybe_evaluate_general
 from app.agents.lead_agent import GraphContext
+from app.agents.skills import (is_skills_enabled, load_skill_context_by_id,
+                               sandbox_available, validate_skill)
 from app.agents.subtask import SubTask
 from app.agents.thread_state import ThreadState
-from app.agents.tools import describe_execute_tools_v2, get_execute_tools
+from app.agents.tools import (describe_execute_tools_v2, get_execute_tools,
+                              load_config_tools)
 from app.core.context import trace_id_ctx_var
 from app.core.log import logger
 from app.core.tracking import TrackingPage, TrackingType
 from app.core.tracking.tracker import track
 from app.llm import create_llm_with_name
+
+#: 技能上下文探测任务 plan_id（与 plan_model_node 保持一致）
+SKILL_PROBE_ID = "skill_probe"
 
 
 async def general_agent(state: ThreadState, config: RunnableConfig, runtime: Runtime[GraphContext]) -> dict:
@@ -53,6 +59,10 @@ async def general_agent(state: ThreadState, config: RunnableConfig, runtime: Run
     if not plan_id:
         return {"completed": True}
 
+    # === skill_probe：技能上下文探测（系统确定性执行，不走 LLM）===
+    if plan_id == SKILL_PROBE_ID:
+        return {"plan_tasks": [SubTask(plan_id=plan_id, step_statuses="completed", result=await _run_skill_probe(plan_tasks))]}
+
     # === 1. 验证依赖任务是否已完成 ===
     deps_results: str = ""
     for dep_id in _get_deps_of(plan_id, plan_tasks):
@@ -76,6 +86,10 @@ async def general_agent(state: ThreadState, config: RunnableConfig, runtime: Run
                         计划 ID：{plan_id}\n
                         依赖任务结果：{deps_results}\n
                         <current_time>{runtime.context.current_time}</current_time>"""
+    # 技能步骤任务：直接附上脚本/参数说明，避免执行 agent 因缺少参数而空跑脚本
+    step_guide = await _skill_step_guide(plan_id, plan_tasks)
+    if step_guide:
+        task_info = f"{task_info}\n{step_guide}"
 
     llm = create_llm_with_name(config, model_name="general_node_model")
     # create_agent 的 tools 参数会在内部自动 bind_tools，无需手动绑定
@@ -85,18 +99,24 @@ async def general_agent(state: ThreadState, config: RunnableConfig, runtime: Run
     role = "general_node_model"
     start = dt.datetime.now().astimezone()
     await track(TrackingType.STEP_START, TrackingPage.EXECUTE, model=role, p0=plan_id, p1=task_name[:100])
+    error_info = ""
     try:
         agent_result = await agent.ainvoke(
             {"messages": [HumanMessage(content=task_info)]},
             config=config,
         )
         status = "completed"
-    except Exception:
+    except Exception as exc:
+        # 失败不裸抛中断全图：返回 failed 状态，交由规划节点按技能错误规则生成恢复 DAG 或人工介入
         status = "failed"
-        raise
+        error_info = str(exc)[:500]
+        logger.warning("执行任务失败 (plan_id={}, trace_id={}): {}", plan_id, trace_id, exc)
     finally:
         duration_ms = int((dt.datetime.now().astimezone() - start).total_seconds() * 1000)
         await track(TrackingType.STEP_COMPLETE, TrackingPage.EXECUTE, model=role, p0=plan_id, p1=task_name[:100], p2=status, p3=str(duration_ms))
+
+    if status == "failed":
+        return {"plan_tasks": [SubTask(plan_id=plan_id, step_statuses="failed", blocked_message=error_info or "执行失败")]}
 
     agent_msgs = agent_result.get("messages", [])
     final_msg = agent_msgs[-1] if agent_msgs else AIMessage(content="")
@@ -119,6 +139,68 @@ async def general_agent(state: ThreadState, config: RunnableConfig, runtime: Run
 
     # === 3. 修改任务状态为 completed ===
     return {"plan_tasks": [SubTask(plan_id=plan_id, step_statuses="completed", result=str(task_result))]}
+
+
+async def _run_skill_probe(plan_tasks: list[SubTask]) -> str:
+    """执行技能上下文探测：校验可用性 + 输出 SOP/错误/清理索引摘要（结果注入下游任务）。"""
+    self_task = next((t for t in plan_tasks if t.plan_id == SKILL_PROBE_ID), None)
+    skill_id = self_task.skill_id if self_task else ""
+    if not skill_id:
+        return "技能上下文探测跳过：未声明 skill_id"
+    try:
+        ctx = await load_skill_context_by_id(skill_id)
+        if ctx is None:
+            return f"技能「{skill_id}」不存在或上下文加载失败（缺少 SKILL.md？）"
+        available = {t.name for t in load_config_tools()}
+        ok, missing = validate_skill(ctx.meta, available)
+        lines = [f"技能「{skill_id}」校验：{'可用' if ok else '缺工具: ' + ','.join(missing)}", ""]
+        if ctx.meta.has_scripts:
+            sb_ok, sb_reason = sandbox_available()
+            lines.append(f"沙箱（自带脚本执行）: {'可用' if sb_ok else f'不可用 - {sb_reason}'}")
+            lines.append("")
+        lines.append(ctx.sop_summary())
+        if ctx.error_rules:
+            lines += ["", "错误码索引：", ctx.error_index()]
+        if ctx.cleanup_rules:
+            lines += ["", "清理规则：", ctx.cleanup_summary()]
+        return "\n".join(lines)
+    except Exception as exc:  # 探测失败不阻塞主流程，下游会看到失败说明
+        logger.warning("技能上下文探测异常 (skill_id=%s): %s", skill_id, exc)
+        return f"技能「{skill_id}」上下文探测异常: {exc}"
+
+
+async def _skill_step_guide(plan_id: str, plan_tasks: list[SubTask]) -> str:
+    """若当前任务带技能步骤标注，返回脚本/参数说明（追加进 task_info）。
+
+    skills.enabled=false 时不注入技能指引。
+    """
+    if not is_skills_enabled():
+        return ""
+    task = _find_task(plan_id, plan_tasks)
+    if task is None or not task.skill_id or not task.sop_step:
+        return ""
+    try:
+        ctx = await load_skill_context_by_id(task.skill_id)
+        if ctx is None:
+            return ""
+        step = next((s for s in ctx.sop_steps if s.step == task.sop_step), None)
+        if step is None:
+            return ""
+        lines = ["<技能步骤指引>"]
+        if step.script:
+            lines.append(f'本任务执行技能脚本 {step.script}（沙箱运行），通过 run_skill_step("{task.skill_id}", "{task.sop_step}", arguments=[...]) 执行')
+            if step.args_required:
+                lines.append(f"脚本必需参数（arguments 依次为命令行参数）: {step.args_hint or '（见脚本用法）'}")
+            else:
+                lines.append("该脚本无需参数，arguments 可省略")
+        elif step.tool:
+            lines.append(f"本任务应调用注册工具「{step.tool}」完成（本地执行）")
+        # 附上 SOP 步骤说明（含产出要求），避免执行 agent 丢弃关键字段（如城市编码）
+        if step.description:
+            lines.append(f"步骤说明: {step.description[:300]}")
+        return "\n".join(lines)
+    except Exception:
+        return ""
 
 
 def _find_task(plan_id: str, plan_tasks: list[SubTask]) -> SubTask | None:

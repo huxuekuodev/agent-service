@@ -1,0 +1,5 @@
+cleanups:
+  - path: "沙箱内临时产物"
+    kind: data
+    level: auto
+    note: 只读查询，脚本在沙箱内运行，沙箱销毁即回收，无本地产物
