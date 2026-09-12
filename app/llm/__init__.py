@@ -18,8 +18,11 @@ from app.llm import instances as _instances  # noqa: F401
 from app.llm.base import LLMInstance, get_llm_instance, list_llm_instances, register
 from app.llm.builders import create_execution_llm, create_llm, create_llm_with_name
 from app.llm.factory import create_chat_model
+from app.llm.usage import LLMCallUsage, UsageCollector
 
 __all__ = [
+    "LLMCallUsage",
+    "UsageCollector",
     "LLMInstance",
     "register",
     "get_llm_instance",

@@ -148,7 +148,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        data = fetch_daily_weather(city_code, api_key="de958b4e906a4fafa422e107aa552df6")
+        data = fetch_daily_weather(city_code, api_key=api_key)
         if as_json:
             print(json.dumps(data, ensure_ascii=False, indent=2))
         else:

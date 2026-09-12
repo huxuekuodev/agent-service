@@ -17,6 +17,7 @@ from app.agents.lead_agent.agent import GraphAgent
 from app.config import get_app_config
 from app.core.checkpointer import create_checkpointer
 from app.core.context import trace_id_ctx_var
+from app.core.log import logger
 from app.core.runtime import RunContext
 
 # LangGraph 多流模式 + subgraphs 的流协议常量
@@ -108,34 +109,28 @@ class AgentService:
         self._agent = None
 
     # ------------------------------------------------------------------
-    # 会话管理
+    # 会话（图状态）
     # ------------------------------------------------------------------
 
-    def create_session(self, *, model_name: str | None = None) -> dict:
-        """创建一个新会话。
+    async def delete_thread(self, thread_id: str) -> bool:
+        """删除该 thread 的 checkpoint（会话逻辑删除时调用）。
 
-        集群安全：不绑定任何节点。session_id 即 thread_id，
-        后续任何节点的请求都能从共享 checkpointer 恢复。
+        会话元数据/消息在业务库（``app.session.store``）；这里只管 agent 运行态。
+        失败不抛出：checkpoint 清理属于"尽力而为"，残留状态不影响用户可见历史。
         """
-        session_id = uuid.uuid4().hex
-        return {"session_id": session_id, "thread_id": session_id, "model_name": model_name}
-
-    def delete_session(self, session_id: str) -> bool:
-        """删除会话（从 checkpointer 删除状态）。
-
-        注意：当前简化版不实现 checkpointer 删除，仅返回 True。
-        生产环境应调用 checkpointer 的删除 API。
-        """
-        # TODO: 调用 checkpointer 删除该 thread 的状态
-        return True
-
-    def list_sessions(self) -> list[str]:
-        """列出活跃会话。
-
-        注意：简化版不维护会话注册表（集群无中心状态）。
-        生产环境应从持久化存储查询会话列表。
-        """
-        return []
+        if not thread_id:
+            return False
+        try:
+            saver = self._run_context.checkpointer if self._run_context else None
+            delete = getattr(saver, "adelete_thread", None)
+            if delete is None:
+                return False
+            await delete(thread_id)
+            logger.info("已清理 checkpoint: thread={}", thread_id)
+            return True
+        except Exception as exc:
+            logger.warning("清理 checkpoint 失败: thread={} err={}", thread_id, exc)
+            return False
 
     # ------------------------------------------------------------------
     # 对话
@@ -147,11 +142,11 @@ class AgentService:
             raise RuntimeError("AgentService 未初始化：请使用 `async with AgentService() as svc:` 进入生命周期后再调用对话接口。")
         return self._agent
 
-    async def chat(self, session_id: str, message: str) -> list[dict]:
+    async def chat(self, thread_id: str, message: str) -> list[dict]:
         """发送消息并等待完整回复（返回消息字典列表）。"""
         self._require_agent()
         messages: list[dict] = []
-        async for event in self.stream(session_id, message):
+        async for event in self.stream(thread_id, message):
             if event["type"] == "values":
                 data = event.get("data", {})
                 msgs = data.get("messages", []) if isinstance(data, dict) else []
@@ -169,23 +164,29 @@ class AgentService:
                 messages.append({"type": "custom", "data": event.get("data")})
         return messages
 
-    async def stream(self, session_id: str, message: str):
+    async def stream(self, thread_id: str, message: str, *, usage: Any = None):
         """发送消息并流式返回事件。
 
-        将 LangGraph 的原始流（``(mode, payload)`` / ``(namespace, (mode, payload))``
-        元组，见 ``agent.astream(stream_mode=[...], subgraphs=True)``）归一化为统一事件::
+        将 LangGraph 的原始流归一化为统一事件::
 
             {"type": "values" | "messages" | "custom", "data": ...}
 
-        ``messages`` 事件为增量 token，供前端流式渲染。
+        当前图只暴露 ``custom`` 轨（见 ``GraphAgent.astream``），前端渲染依赖其中的
+        业务事件；模型 token 增量与用量走 ``usage`` 采集器（callback）。
+
+        Args:
+            thread_id: 会话 ``checkpoint_thread_id``（默认等于 session_id）。
+            message: 用户消息。
+            usage: 可选用量采集器（``app.llm.usage.UsageCollector``），本次请求结束后读总数。
         """
         agent = self._require_agent()
         trace_id = trace_id_ctx_var.get() or uuid.uuid4().hex
         state = {"messages": [HumanMessage(content=message)]}
         async for st in agent.astream(
             state,
-            thread_id=session_id,
+            thread_id=thread_id,
             trace_id=trace_id,
+            usage=usage,
         ):
             event = _normalize_stream_event(st)
             if event is not None:

@@ -4,6 +4,7 @@ import { ref, watch, nextTick } from 'vue'
 const props = defineProps({
   messages: { type: Array, default: () => [] },
   thinking: { type: String, default: '' },
+  progress: { type: Array, default: () => [] },
   streaming: { type: Boolean, default: false },
 })
 
@@ -28,7 +29,7 @@ function onKeydown(e) {
 
 // 新消息时滚到底部
 watch(
-  () => [props.messages.length, props.messages.at(-1)?.content, props.thinking],
+  () => [props.messages.length, props.messages.at(-1)?.content, props.thinking, props.progress.length],
   async () => {
     await nextTick()
     if (listEl.value) listEl.value.scrollTop = listEl.value.scrollHeight
@@ -60,6 +61,10 @@ watch(
 
       <div v-if="thinking" class="think-bubble">
         <span class="spinner" /> {{ thinking }}
+      </div>
+
+      <div v-if="progress.length" class="progress">
+        <div v-for="(line, i) in progress" :key="i" class="progress-line">{{ line }}</div>
       </div>
     </div>
 
@@ -255,5 +260,21 @@ textarea:disabled {
   font-size: 12px;
   color: #b6bcc6;
   margin: 6px 0 0;
+}
+
+.progress {
+  margin: 6px 12px 0;
+  padding: 8px 10px;
+  border-left: 2px solid var(--border);
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.7;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.progress-line {
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 </style>

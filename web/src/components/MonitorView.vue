@@ -14,7 +14,7 @@ import {
 } from '../api'
 
 const props = defineProps({
-  sessionId: { type: String, default: '' },
+  userId: { type: String, default: '' },
 })
 
 // ---------------------------------------------------------------------------
@@ -215,12 +215,12 @@ async function saveMeanings() {
 const tokenUsage = ref([])
 
 async function loadTokenUsage() {
-  if (!props.sessionId) {
+  if (!props.userId) {
     tokenUsage.value = []
     return
   }
   try {
-    tokenUsage.value = await monitorTokenUsage(props.sessionId)
+    tokenUsage.value = await monitorTokenUsage(props.userId)
   } catch (e) {
     console.warn('加载 token 汇总失败:', e)
   }
@@ -355,7 +355,7 @@ loadTokenUsage()
     <!-- Token 消耗汇总 -->
     <section class="token-card">
       <h3>💳 Token 消耗汇总（当前会话）</h3>
-      <p v-if="!sessionId" class="muted">创建/进入会话后可查看该会话（用户）的累计 token 消耗。</p>
+      <p v-if="!userId" class="muted">登录后可查看当前用户的累计 token 消耗（按模型区分）。</p>
       <table v-else-if="tokenUsage.length">
         <thead>
           <tr><th>模型</th><th>输入 token</th><th>输出 token</th><th>总 token</th><th>费用(元)</th></tr>

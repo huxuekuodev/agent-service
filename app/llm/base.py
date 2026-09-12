@@ -31,6 +31,13 @@ class LLMInstance:
     max_tokens: int | None = None
     timeout: float = 60.0
     max_retries: int = 2
+    stream_usage: bool = True
+    """流式返回时是否附带 token 用量（chunk 上的 ``usage_metadata``）。
+
+    默认开启：本服务对话走流式，只有打开它才能拿到每轮 input/output token，
+    用于 ``messages.token_*`` 落库与 ``user_token_usage`` 累计（按问题/按用户统计）。
+    渠道类不支持该参数时 factory 自动跳过（不会因此构建失败）。
+    """
     supports_thinking: bool = False
     """是否支持 thinking（规划/执行节点是否可开启）。"""
     supports_vision: bool = False

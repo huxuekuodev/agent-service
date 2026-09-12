@@ -19,6 +19,23 @@ from psycopg_pool import AsyncConnectionPool
 logger = logging.getLogger(__name__)
 
 
+def _build_serde() -> Any:
+    """构造 checkpointer 序列化器，登记项目自定义消息类型。
+
+    LangGraph 反序列化未登记的自定义类型时会告警并提示未来将禁用（或要求
+    ``LANGGRAPH_STRICT_MSGPACK=true``）。这里显式允许本项目自定义类型
+    （如 ``app.agents.subtask.SubTask``），避免依赖环境变量开关。
+    """
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+    return JsonPlusSerializer(
+        allowed_msgpack_modules=[
+            ("app.agents.subtask", "SubTask"),
+            "app.agents.subtask",
+        ]
+    )
+
+
 def create_checkpointer(app_config: Any) -> Any:
     """创建 checkpointer。
 
@@ -47,7 +64,7 @@ def create_checkpointer(app_config: Any) -> Any:
     # 默认 memory
     from langgraph.checkpoint.memory import InMemorySaver
 
-    return InMemorySaver()
+    return InMemorySaver(serde=_build_serde())
 
 
 def _build_postgres_pool(conn_string: str) -> AsyncConnectionPool[AsyncConnection[Any]]:
@@ -81,7 +98,7 @@ def _create_postgres_checkpointer(url: str) -> PostgresCheckpointerHandle:
     from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
     pool = _build_postgres_pool(url)
-    saver = AsyncPostgresSaver(conn=pool)
+    saver = AsyncPostgresSaver(conn=pool, serde=_build_serde())
     return PostgresCheckpointerHandle(saver, pool)
 
 

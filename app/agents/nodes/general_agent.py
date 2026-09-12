@@ -10,20 +10,20 @@
 
 import asyncio
 import datetime as dt
+from typing import Any
 
 from langchain.agents import create_agent
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.runtime import Runtime
 
 from app.agents.evaluation.general_evaluator import maybe_evaluate_general
+from app.agents.events import Output, StepStatus, ToolCallAccumulator
 from app.agents.lead_agent import GraphContext
-from app.agents.skills import (is_skills_enabled, load_skill_context_by_id,
-                               sandbox_available, validate_skill)
+from app.agents.skills import is_skills_enabled, load_skill_context_by_id, sandbox_available, validate_skill
 from app.agents.subtask import SubTask
 from app.agents.thread_state import ThreadState
-from app.agents.tools import (describe_execute_tools_v2, get_execute_tools,
-                              load_config_tools)
+from app.agents.tools import describe_execute_tools_v2, get_execute_tools, load_config_tools
 from app.core.context import trace_id_ctx_var
 from app.core.log import logger
 from app.core.tracking import TrackingPage, TrackingType
@@ -95,32 +95,37 @@ async def general_agent(state: ThreadState, config: RunnableConfig, runtime: Run
     # create_agent 的 tools 参数会在内部自动 bind_tools，无需手动绑定
     agent = create_agent(model=llm, tools=await get_execute_tools(), system_prompt=system_prompt, name="general_node_agent")
 
-    # 执行节点埋点：step_start / step_complete（p0=plan_id, p1=任务名, p2=状态, p3=耗时ms）
+    # 执行节点埋点 + 事件：step started / completed / failed（前端步骤卡片与进度）
+    current = _find_task(plan_id, plan_tasks)
+    task_skill = {"skill_id": current.skill_id if current else "", "sop_step": current.sop_step if current else ""}
+    out = Output("general_agent", trace_id=trace_id)
+    out.think(f"▶️ 开始执行：{task_name}")
+    out.step(plan_id=plan_id, name=task_name, status=StepStatus.STARTED, skill_id=task_skill.get("skill_id", ""), sop_step=task_skill.get("sop_step", ""))
+
     role = "general_node_model"
     start = dt.datetime.now().astimezone()
     await track(TrackingType.STEP_START, TrackingPage.EXECUTE, model=role, p0=plan_id, p1=task_name[:100])
     error_info = ""
     try:
-        agent_result = await agent.ainvoke(
-            {"messages": [HumanMessage(content=task_info)]},
-            config=config,
-        )
+        agent_msgs = await _run_execution_agent(agent, task_info, config=config, out=out, plan_id=plan_id)
         status = "completed"
     except Exception as exc:
         # 失败不裸抛中断全图：返回 failed 状态，交由规划节点按技能错误规则生成恢复 DAG 或人工介入
         status = "failed"
         error_info = str(exc)[:500]
+        agent_msgs = []
         logger.warning("执行任务失败 (plan_id={}, trace_id={}): {}", plan_id, trace_id, exc)
     finally:
         duration_ms = int((dt.datetime.now().astimezone() - start).total_seconds() * 1000)
         await track(TrackingType.STEP_COMPLETE, TrackingPage.EXECUTE, model=role, p0=plan_id, p1=task_name[:100], p2=status, p3=str(duration_ms))
 
     if status == "failed":
+        out.step(plan_id=plan_id, name=task_name, status=StepStatus.FAILED, detail=error_info or "执行失败")
         return {"plan_tasks": [SubTask(plan_id=plan_id, step_statuses="failed", blocked_message=error_info or "执行失败")]}
 
-    agent_msgs = agent_result.get("messages", [])
     final_msg = agent_msgs[-1] if agent_msgs else AIMessage(content="")
     task_result = final_msg.content if hasattr(final_msg, "content") else str(final_msg)
+    out.step(plan_id=plan_id, name=task_name, status=StepStatus.COMPLETED, detail=str(task_result), **task_skill)
 
     # === 2.1 执行节点评估（LLM-as-Judge，非致命）===
     # 评估执行 agent 的工具调用路径效率；未配置 / 被禁用 / 失败时静默跳过，不影响主流程。
@@ -139,6 +144,45 @@ async def general_agent(state: ThreadState, config: RunnableConfig, runtime: Run
 
     # === 3. 修改任务状态为 completed ===
     return {"plan_tasks": [SubTask(plan_id=plan_id, step_statuses="completed", result=str(task_result))]}
+
+
+async def _run_execution_agent(agent: Any, task_info: str, *, config: RunnableConfig, out: Output, plan_id: str) -> list[BaseMessage]:
+    """流式运行执行 agent：转发增量与工具调用事件，返回完整 transcript。
+
+    transcript 以 ``updates`` 为准（含 tool_calls / ToolMessage），增量 chunk 只用于展示。
+    """
+    accumulator = ToolCallAccumulator()
+    collected: dict[str, BaseMessage] = {}
+
+    async for mode, payload in agent.astream({"messages": [HumanMessage(content=task_info)]}, config=config, stream_mode=["messages", "updates"]):
+        if mode == "messages":
+            chunk = payload[0] if isinstance(payload, (tuple, list)) and payload else payload
+            out.thinking(_text_delta(chunk))
+            for call in accumulator.feed(chunk):
+                out.tool_call(name=call["name"], args=call["args"], plan_id=plan_id)
+            continue
+
+        if mode != "updates" or not isinstance(payload, dict):
+            continue
+        for update in payload.values():
+            if not isinstance(update, dict):
+                continue
+            for msg in update.get("messages") or []:
+                collected[getattr(msg, "id", None) or f"{type(msg).__name__}:{getattr(msg, 'content', '')}"] = msg
+                if isinstance(msg, ToolMessage):
+                    out.tool_result(name=msg.name or "", result=str(msg.content or ""), ok=str(getattr(msg, "status", "")) != "error", plan_id=plan_id)
+
+    return list(collected.values())
+
+
+def _text_delta(chunk: Any) -> str:
+    """取流式 chunk 的文本增量（兼容 str 与 text-block 列表）。"""
+    content = getattr(chunk, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(str(b.get("text", "")) for b in content if isinstance(b, dict) and b.get("type") == "text")
+    return ""
 
 
 async def _run_skill_probe(plan_tasks: list[SubTask]) -> str:
@@ -215,11 +259,12 @@ def _get_deps_of(plan_id: str, plan_tasks: list[SubTask]) -> list[str]:
 
 
 async def _load_local_general_prompt(tools_desc: str) -> str:
-    """从 app/prompts/ 读取通用执行节点提示词，替换 tools_desc 占位符（异步读文件）。"""
+    """从 app/prompts/ 读取通用执行节点提示词，替换 tools_desc 占位符（文件 IO 放线程池）。"""
     from pathlib import Path
 
-    async def _read() -> str:
-        prompt_dir = Path(__file__).resolve().parent.parent.parent.parent / "prompts"
+    def _read() -> str:
+        # __file__ = app/agents/nodes/general_agent.py → parents[2] = app/，提示词在 app/prompts/
+        prompt_dir = Path(__file__).resolve().parents[2] / "prompts"
         path = prompt_dir / "general_agent_system_prompt.md"
         if path.exists():
             return path.read_text(encoding="utf-8")
@@ -227,6 +272,5 @@ async def _load_local_general_prompt(tools_desc: str) -> str:
 
     content = await asyncio.to_thread(_read)
     if content:
-        # pyrefly: ignore [missing-attribute]
         return content.replace("{{tools_desc}}", tools_desc or "")
     return ("你是通用执行节点，负责完成分配的任务。\n可用工具:\n{tools_desc}\n请执行任务并返回结果。").format(tools_desc=tools_desc or "")

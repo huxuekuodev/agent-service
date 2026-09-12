@@ -29,25 +29,44 @@ from app.core.log import logger  # noqa: E402
 from app.core.response import BAD_REQUEST, INTERNAL_ERROR, NOT_FOUND, BizError, err  # noqa: E402
 from app.monitor import store as monitor_store  # noqa: E402
 from app.monitor.router import router as monitor_router  # noqa: E402
-from app.routers import health, knowledge, sessions  # noqa: E402
+from app.routers import auth, health, knowledge, sessions  # noqa: E402
+from app.session import store as session_store  # noqa: E402
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """应用 lifespan：管理 AgentService / 知识库摄取服务资源生命周期。"""
+    """应用 lifespan：管理 AgentService / 业务库 / 知识库摄取服务资源生命周期。"""
     from app.agent_service import AgentService
+    from app.auth.service import AuthService
     from app.config import get_app_config
     from app.rag.ingest_service import KnowledgeIngestService
+    from app.session.service import SessionService
 
-    # 进入服务生命周期（打开 postgres 连接池 + setup 建表；memory 直接可用）
+    config = get_app_config()
+
+    # 进入服务生命周期（打开 checkpoint postgres 连接池 + setup 建表；memory 直接可用）
     service = await AgentService().__aenter__()
     app.state.agent_service = service
+    app.state.auth_service = AuthService()
+    app.state.session_service = SessionService()
     logger.info("Deer Agent Service 启动，AgentService 已初始化")
+
+    # 业务库（用户/会话/消息）：未配置时功能降级，不影响对话
+    if session_store.is_available():
+        try:
+            await session_store.get_pool()
+            logger.info("业务库已连接（用户/会话/消息持久化可用）")
+        except Exception as exc:
+            logger.error("业务库连接失败（会话/历史将不可用）: {}", exc)
+    else:
+        logger.warning("未配置业务库（business_database.postgres_url / BUSINESS_DATABASE_URL）：会话不能持久化，/sessions 不可用")
+
+    if config.auth.enabled and not config.auth.jwt_secret:
+        logger.warning("已启用认证但未配置 auth.jwt_secret / JWT_SECRET：登录接口不可用")
 
     # 知识库摄取服务（语雀 → 分块 → 图片转文字 → ES；独立于主对话 Agent）
     # 手动接口可用性取决于 yuque.enabled；自动同步再叠加 ingest.enabled + auto_interval_seconds。
     ingest_service: KnowledgeIngestService | None = None
-    config = get_app_config()
     if config.ingest.enabled or config.yuque.enabled:
         try:
             ingest_service = KnowledgeIngestService(app_config=config)
@@ -63,17 +82,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     try:
         yield
     finally:
-        # 释放资源（关闭 postgres 连接池 + 摄取服务 + 监控存储）
+        # 释放资源（checkpoint 连接池 + 摄取服务 + 监控/业务库存储）
         await service.__aexit__(None, None, None)
         if ingest_service is not None:
             try:
                 await ingest_service.aclose()
             except Exception as exc:
                 logger.warning("知识库摄取服务关闭异常: {}", exc)
-        try:
-            await monitor_store.aclose()
-        except Exception as exc:
-            logger.warning("监控存储关闭异常: {}", exc)
+        for name, closer in (("监控存储", monitor_store.aclose), ("业务库", session_store.aclose)):
+            try:
+                await closer()
+            except Exception as exc:
+                logger.warning("{}关闭异常: {}", name, exc)
         logger.info("Deer Agent Service 关闭，AgentService 已释放")
 
 
@@ -98,6 +118,7 @@ app.add_middleware(
 
 # 注册路由
 app.include_router(health.router)
+app.include_router(auth.router)
 app.include_router(sessions.router)
 app.include_router(knowledge.router)
 app.include_router(monitor_router)

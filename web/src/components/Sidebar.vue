@@ -3,9 +3,10 @@ defineProps({
   sessions: { type: Array, default: () => [] },
   currentId: { type: String, default: null },
   open: { type: Boolean, default: false },
+  user: { type: Object, default: null },
 })
 
-const emit = defineEmits(['create', 'select', 'delete', 'close'])
+const emit = defineEmits(['create', 'select', 'delete', 'close', 'logout'])
 </script>
 
 <template>
@@ -25,6 +26,7 @@ const emit = defineEmits(['create', 'select', 'delete', 'close'])
         :key="s.id"
         class="item"
         :class="{ active: s.id === currentId }"
+        :title="s.preview || s.title"
         @click="emit('select', s.id)"
       >
         <span class="item-title">{{ s.title || '新会话' }}</span>
@@ -36,6 +38,12 @@ const emit = defineEmits(['create', 'select', 'delete', 'close'])
           🗑
         </button>
       </div>
+      <div v-if="!sessions.length" class="empty">还没有会话，点上方「新建会话」开始</div>
+    </div>
+
+    <div v-if="user" class="footer">
+      <span class="user-name" :title="user.username">{{ user.display_name || user.username }}</span>
+      <button class="icon-btn logout-btn" title="退出登录" @click="emit('logout')">⎋</button>
     </div>
   </div>
 </template>
@@ -147,6 +155,35 @@ const emit = defineEmits(['create', 'select', 'delete', 'close'])
 
 .icon-btn:active {
   background: rgba(0, 0, 0, 0.06);
+}
+
+.empty {
+  padding: 16px 12px;
+  font-size: 13px;
+  color: var(--text-2);
+  line-height: 1.6;
+}
+
+.footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--border);
+}
+
+.user-name {
+  font-size: 13px;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.logout-btn {
+  font-size: 15px;
+  color: var(--text-2);
 }
 
 /* 手机端：抽屉式侧边栏 */

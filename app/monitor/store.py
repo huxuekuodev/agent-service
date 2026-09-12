@@ -5,8 +5,10 @@
   - ``monitor_field_meanings`` 各业务名称（page）下 Ext 槽位的含义（用户在监控平台配置）
   - ``user_token_usage``     用户累计 token 消耗（按模型区分，含费用）
 
-依赖 config.yaml ``database``（backend=postgres）；非 postgres 后端调用会抛出
-``MonitorStoreError``（监控功能需 PostgreSQL）。
+**存储在业务库**（config.yaml ``business_database``，与用户/会话/消息同库）：
+监控配置属于业务数据，放在业务库便于统一备份与跨表分析（token 用量可与
+``messages.token_*`` 对账）。表由 ``deploy/sql/business_schema.sql`` 创建，
+本模块的 ``ensure_tables`` 仅作为幂等兜底。未配置业务库时抛 ``MonitorStoreError``。
 """
 
 from __future__ import annotations
@@ -86,15 +88,15 @@ _SCHEMA_STATEMENTS = [
 ]
 
 
-def _backend_is_postgres() -> bool:
+def _business_db_config():
     from app.config import get_app_config
 
-    return get_app_config().database.backend == "postgres"
+    return get_app_config().business_database
 
 
 def is_available() -> bool:
-    """监控存储是否可用（仅 postgres 后端支持）。"""
-    return _backend_is_postgres()
+    """监控存储是否可用（已配置业务库即可用）。"""
+    return _business_db_config().enabled
 
 
 async def _get_pool() -> AsyncConnectionPool:
@@ -102,16 +104,13 @@ async def _get_pool() -> AsyncConnectionPool:
     global _pool
     if _pool is not None:
         return _pool
-    if not _backend_is_postgres():
-        raise MonitorStoreError("监控存储需要 PostgreSQL（config.yaml database.backend=postgres）")
+    config = _business_db_config()
+    if not config.enabled:
+        raise MonitorStoreError("监控存储需要业务库：请配置 config.yaml business_database.postgres_url / .env BUSINESS_DATABASE_URL")
 
-    from app.config import get_app_config
     from app.core.checkpointer import _build_postgres_pool
 
-    url = get_app_config().database.postgres_url
-    if not url:
-        raise MonitorStoreError("database.backend=postgres 但未配置 database.postgres_url")
-    _pool = _build_postgres_pool(url)
+    _pool = _build_postgres_pool(config.postgres_url)
     # 限制连接/建表耗时，避免 PG 不可达时拖垮请求路径
     await asyncio.wait_for(_pool.open(), timeout=10.0)
     await asyncio.wait_for(ensure_tables(), timeout=10.0)

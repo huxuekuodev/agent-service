@@ -31,6 +31,16 @@ SESSION_NOT_FOUND = 1100  # 会话不存在
 SESSION_EXISTS = 1101  # 会话已存在（创建时冲突）
 SERVICE_NOT_READY = 1102  # AgentService 未初始化
 
+# 认证相关（1200 - 1299）
+UNAUTHORIZED = 1200  # 未登录 / 凭证缺失
+TOKEN_EXPIRED = 1201  # 令牌过期（前端应静默刷新）
+TOKEN_INVALID = 1202  # 令牌非法（需重新登录）
+USER_EXISTS = 1203  # 用户已存在
+PASSWORD_TOO_WEAK = 1204  # 密码强度不足
+USER_DISABLED = 1205  # 用户被禁用/锁定
+CREDENTIALS_INVALID = 1206  # 账号或密码错误
+STORE_UNAVAILABLE = 1207  # 存储不可用（业务库未配置/连接失败）
+
 
 def ok(data: Any = None, msg: str = "") -> dict[str, Any]:
     """构造成功响应。"""

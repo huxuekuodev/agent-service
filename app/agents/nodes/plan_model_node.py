@@ -15,13 +15,13 @@
 """
 
 import asyncio
-from typing import Any, cast
+from dataclasses import dataclass, field
+from typing import Any
 
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langfuse import Langfuse
-from langgraph.config import get_stream_writer
 from langgraph.runtime import Runtime
 from langgraph.types import Overwrite
 from pydantic import BaseModel, Field
@@ -29,12 +29,13 @@ from pydantic import BaseModel, Field
 from app.agents.current_time import has_current_time_for_today
 from app.agents.errors import build_error_fallback_message, classify_llm_error
 from app.agents.evaluation.plan_evaluator import EvaluationInput, maybe_evaluate_plan
+from app.agents.events import Output, ToolCallAccumulator
 from app.agents.lead_agent import GraphContext
 from app.agents.middlewares.clarification_middleware import ClarificationMiddleware
 from app.agents.middlewares.dangling_tool_call_middleware import DanglingToolCallMiddleware
-from app.agents.nodes.constants import THINK_MES
 from app.agents.subtask import SubTask
 from app.agents.thread_state import ThreadState
+from app.agents.tools import describe_execute_tools, get_plan_tools
 from app.core.context import trace_id_ctx_var
 from app.core.log import logger
 from app.core.tracking import TrackingPage, TrackingType
@@ -42,6 +43,7 @@ from app.core.tracking.tracker import track
 from app.llm import create_llm_with_name
 
 
+# 构建 system prompt
 class SkillChoice(BaseModel):
     """命中的技能候选（模型结构化输出）。"""
 
@@ -155,8 +157,8 @@ def _inject_skill_probe(subtasks: list[SubTask], skill_ids: list[str]) -> list[S
     return result
 
 
-async def _skill_blocks_for(existing_tasks: list[SubTask]) -> list[str]:
-    """从已有任务生成 <SelectedSkill>/<SkillErrors> 上下文块（供 review/恢复规划）。
+async def _skill_error_prompt(existing_tasks: list[SubTask]) -> list[str]:
+    """从已有任务生成 <SkillErrors> 上下文块（供 review/恢复规划）。
 
     skills.enabled=false 时不注入技能上下文。
     """
@@ -168,10 +170,8 @@ async def _skill_blocks_for(existing_tasks: list[SubTask]) -> list[str]:
     skill_ids = {t.skill_id for t in existing_tasks if t.skill_id}
     if not skill_ids:
         return blocks
-
     from app.agents.skills import load_skill_context_by_id
 
-    outlines: list[str] = []
     errors: list[str] = []
     for sid in sorted(skill_ids):
         ctx = await load_skill_context_by_id(sid)
@@ -180,181 +180,231 @@ async def _skill_blocks_for(existing_tasks: list[SubTask]) -> list[str]:
         failed = [t for t in existing_tasks if t.skill_id == sid and t.step_statuses == "failed"]
         if failed:
             errors.append(f"技能 {sid} 错误处理规则：\n{ctx.error_index()}")
-        if any(t.skill_id == sid and (t.step_statuses in ("completed", "in_progress", "not_started", "failed")) for t in existing_tasks):
-            outline = ctx.sop_summary()
-            if outline:
-                outlines.append(f"技能 {sid} SOP 大纲：\n{outline}")
-    if outlines:
-        blocks.append("<SelectedSkill>\n" + "\n\n".join(outlines) + "\n</SelectedSkill>")
+
     if errors:
         blocks.append("<SkillErrors>\n" + "\n\n".join(errors) + "\n</SkillErrors>")
     return blocks
 
 
-async def plan_model_node(state: ThreadState, config: RunnableConfig, runtime: Runtime[GraphContext]) -> dict:
-    context = runtime.context
-    # llm = context.plan_llm
-    # assert llm is not None, "plan_llm is required in GraphContext"
-    writer = get_stream_writer()
-    trace_id = trace_id_ctx_var.get()
+@dataclass
+class PlanRun:
+    """一次规划 agent 运行的结果（transcript + 结构化输出 + 澄清信息）。"""
 
-    # 获取已有任务列表（review/replan 场景）
-    existing_tasks = state.get("plan_tasks", [])
-    writer({"type": THINK_MES, "messages": "📋 分析需求，制定执行计划...", "trace_id": trace_id})
+    plan_output: PlanOutput | None = None
+    new_messages: list[BaseMessage] = field(default_factory=list)
+    """本轮新增消息（含 tool 消息），用于按需写回 state。"""
+    all_messages: list[BaseMessage] = field(default_factory=list)
+    """规划 agent 的完整 transcript（历史 + 新增），保 KV 前缀用。"""
+    has_clarification: bool = False
+    clarify_args: dict[str, Any] = field(default_factory=dict)
+    """ask_clarification 的调用参数（问题/类型/选项），用于前端澄清卡片。"""
 
-    # 构建 system prompt
-    from app.agents.tools import describe_execute_tools, get_plan_tools
 
-    capability_desc = await describe_execute_tools()
+async def _build_capability_desc() -> str:
+    """执行能力描述 + 技能索引（供规划节点感知可用工具与技能）。"""
+    capability = await describe_execute_tools()
     skills_index = await _skills_index_text()
-    if skills_index:
-        capability_desc = f"{capability_desc}\n\n{skills_index}" if capability_desc else skills_index
+    if not skills_index:
+        return capability
+    return f"{capability}\n\n{skills_index}" if capability else skills_index
 
-    plan_context = ""
-    if existing_tasks:
-        plan_context = "\n".join(f"- [{t.step_statuses}] plan_id: {t.plan_id}: 任务名称: {t.name}: 执行结果：【{t.result if t.result else '待执行'}】" for t in existing_tasks)
 
-    # 构建消息
-    messages: list[BaseMessage] = []
+def _render_plan_status(existing_tasks: list[SubTask]) -> str:
+    """把当前计划渲染成 <PlanStatus> 文本（review / replan 用）。"""
+    return "\n".join(f"- [{t.step_statuses}] plan_id: {t.plan_id}: 任务名称: {t.name}: 执行结果：【{t.result or '待执行'}】" for t in existing_tasks)
+
+
+async def _build_messages(state: ThreadState, context: GraphContext, plan_context: str) -> list[BaseMessage]:
+    """组装本轮规划 agent 的输入消息：历史 + （PlanStatus / 技能上下文）+ 当前时间。"""
     user_msgs = state.get("messages", [])
-    messages.extend(user_msgs)
-    context_lines = []
+    messages: list[BaseMessage] = list(user_msgs)
+    context_lines: list[str] = []
     if plan_context:
-        context_lines.append(f"""<PlanStatus>\n当前计划
-        {plan_context}\n\n
-        </PlanStatus>""")
-    # 技能上下文：命中技能/失败恢复时把 SOP 大纲与错误规则注入（review/恢复规划用）
-    skill_blocks = await _skill_blocks_for(existing_tasks)
-    context_lines.extend(skill_blocks)
+        context_lines.append(f"<PlanStatus>\n当前计划{plan_context}\n\n</PlanStatus>")
+    context_lines.extend(await _skill_error_prompt(state.get("plan_tasks", [])))
     if context_lines:
         messages.append(HumanMessage(content="\n".join(context_lines)))
-    # 注入当前时间（供 agent 处理日期相关任务，如"今日天气"）
-    # 若 state.messages 中已存在今天的 <current_time> 则不重复注入；
-    # 只有不存在或已过期（非今天）时才追加一条新的当前时间消息。
     if not has_current_time_for_today(user_msgs):
         messages.append(HumanMessage(content=f"<current_time>{context.current_time}</current_time>"))
+    return messages
 
-    # 捕获评估输入轨迹（规划 agent 实际看到的全部上下文，用于公平评估）
-    eval_input = _capture_eval_input(
-        messages=messages,
-        plan_context=plan_context,
-        current_time=context.current_time,
-    )
 
-    # 绑定工具：仅 ask_clarification（get_plan_tools 已包含）。
-    plan_tools = await get_plan_tools()
+def _message_key(msg: BaseMessage) -> str:
+    """消息去重键（无 id 时退化为类型 + 内容）。"""
+    return getattr(msg, "id", None) or f"{type(msg).__name__}:{getattr(msg, 'content', '')}"
+
+
+def _text_of(chunk: Any) -> str:
+    """取流式 chunk 的文本增量（兼容 str 与 text-block 列表）。"""
+    content = getattr(chunk, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(str(b.get("text", "")) for b in content if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def _coerce_plan_output(structured: Any) -> PlanOutput | None:
+    """把 structured_response 归一化为 PlanOutput。"""
+    if isinstance(structured, PlanOutput):
+        return structured
+    if isinstance(structured, dict):
+        try:
+            return PlanOutput.model_validate(structured)
+        except Exception:
+            return None
+    return None
+
+
+async def _run_plan_agent(config: RunnableConfig, messages: list[BaseMessage], out: Output) -> PlanRun:
+    """运行规划 agent（流式消费），返回结构化计划与本轮 transcript。
+
+    - ``messages`` 流：转发模型增量（打字机）+ 累积工具调用（实时展示执行动作）；
+    - ``updates`` 流：收集 transcript（含 tool 消息）、捕获结构化输出与澄清参数。
+
+    注意：transcript 以 ``updates`` 为准，不能用增量 chunk 重建（会丢 tool_calls / ToolMessage）。
+    """
     agent = create_agent(
         create_llm_with_name(config, model_name="plan_node_model"),
-        plan_tools,
-        middleware=[
-            # 修复历史消息中"带 tool_calls 的 AIMessage 缺少对应 ToolMessage"的问题
-            # （用户中断/压缩导致），否则 OpenAI 兼容 API 报 400。
-            DanglingToolCallMiddleware(),
-            ClarificationMiddleware(),
-        ],
+        await get_plan_tools(),
+        middleware=[DanglingToolCallMiddleware(), ClarificationMiddleware()],
         name="plan_node_agent",
         response_format=PlanOutput,
-        system_prompt=await _build_system_prompt(capability_descriptions=capability_desc),
+        system_prompt=await _build_system_prompt(capability_descriptions=await _build_capability_desc()),
     )
 
-    # 规划节点重试机制：由 LangGraph 的 retry_policy（见 lead_agent/agent.py）接管。
-    # 可恢复的 LLM 错误（超时/连接/5xx/429/服务繁忙）→ raise 交由 retry_policy 重试；
-    # 欠费/认证失败等不可恢复错误 → 直接返回中文友好提示。
-    try:
-        # cast: create_agent 的输入类型是 _InputAgentState，实际传入 dict[str, list[BaseMessage]]
-        # 是 langchain 标准用法，运行时安全；cast 消除静态类型噪音。
-        agent_output = await agent.ainvoke(cast(Any, {"messages": messages}), config=config)
-        agent_msgs: list[BaseMessage] = agent_output.get("messages", []) if isinstance(agent_output, dict) else []
-        # 判定 agent 的实际输出类型（不管进哪个分支，都先评估）。
-        # 注意：agent_output["messages"] 包含历史 + 本轮新增，若遍历全部，
-        # 历史中曾出现过的 ask_clarification 调用会让 has_clarification 永远为 True
-        # （用户已澄清后仍误判为"等待澄清"）。因此只检查「本轮新增」的消息。
-        input_msg_ids = {getattr(m, "id", None) for m in messages if getattr(m, "id", None)}
-        new_msgs = [m for m in agent_msgs if getattr(m, "id", None) not in input_msg_ids]
-        has_clarification = any(isinstance(m, AIMessage) and getattr(m, "tool_calls", None) and any(tc.get("name") == "ask_clarification" for tc in m.tool_calls) for m in new_msgs)
-        plan_output = _extract_plan_output(agent_output)
+    run = PlanRun()
+    accumulator = ToolCallAccumulator(ignore_names={"PlanOutput"})  # 结构化输出是内部机制，不对用户展示
+    collected: dict[str, BaseMessage] = {}
+    input_ids = {m.id for m in messages if getattr(m, "id", None)}
 
-        # 填充评估输入，统一触发评估（覆盖澄清 / 规划 / 直接回复 全部分支）
-        eval_input.clarification_requested = has_clarification
-        if plan_output:
-            eval_input.plan_action = plan_output.action
-            eval_input.tasks = [t.model_dump() for t in plan_output.tasks]
-        await maybe_evaluate_plan(
-            trace_id=trace_id,
-            eval_input=eval_input,
-            messages=messages,
-            config=config,
-            runtime=runtime,
+    async for mode, payload in agent.astream(input={"messages": messages}, config=config, stream_mode=["messages", "updates"]):
+        if mode == "messages":
+            chunk = payload[0] if isinstance(payload, (tuple, list)) and payload else payload
+            out.thinking(_text_of(chunk))
+            for call in accumulator.feed(chunk):
+                out.tool_call(name=call["name"], args=call["args"])
+                if call["name"] == "ask_clarification":
+                    run.clarify_args = call.get("args") or {}
+            continue
+
+        if mode != "updates" or not isinstance(payload, dict):
+            continue
+        for update in payload.values():
+            if not isinstance(update, dict):
+                continue
+            for msg in update.get("messages") or []:
+                collected[_message_key(msg)] = msg
+                if isinstance(msg, ToolMessage):
+                    out.tool_result(name=msg.name or "", result=str(msg.content or ""), ok=str(getattr(msg, "status", "")) != "error")
+                    if msg.name == "ask_clarification" and not run.clarify_args:
+                        run.clarify_args = {"question": str(msg.content or "")}
+            structured = update.get("structured_response")
+            if structured is not None:
+                run.plan_output = _coerce_plan_output(structured) or run.plan_output
+
+    run.all_messages = list(collected.values())
+    run.new_messages = [m for m in run.all_messages if getattr(m, "id", None) not in input_ids]
+    run.has_clarification = any(isinstance(m, AIMessage) and any(tc.get("name") == "ask_clarification" for tc in (m.tool_calls or [])) for m in run.new_messages)
+    if run.plan_output is None:
+        run.plan_output = _extract_plan_output({"messages": run.all_messages})
+    return run
+
+
+async def _apply_plan_result(
+    *,
+    run: PlanRun,
+    existing_tasks: list[SubTask],
+    out: Output,
+    config: RunnableConfig,
+    trace_id: str,
+) -> dict:
+    """按规划结果落库并向前端发事件（澄清 / 最终答复 / 规划 / 直接回复）。"""
+    from app.agents.skills import is_skills_enabled
+
+    plan_output = run.plan_output
+    model = _request_model(config)
+
+    # 1) 澄清：描述不清，等用户补充（transcript 以干净 AIMessage 回复用户）
+    if run.has_clarification:
+        clean_msgs = _clean_clarification_messages(run.new_messages)
+        question = str(clean_msgs[-1].content) if clean_msgs else str(run.clarify_args.get("question", ""))
+        out.clarify(
+            content=question,
+            clarification_type=str(run.clarify_args.get("clarification_type", "") or ""),
+            options=list(run.clarify_args.get("options") or []) or None,
+            context=str(run.clarify_args.get("context", "") or ""),
         )
+        await track(TrackingType.CLARIFY, TrackingPage.PLAN, model=model, p4=question[:200])
+        return {"messages": clean_msgs, "completed": True}
 
-        # 澄清：需求含糊时 agent 调用了 ask_clarification → 中断等待用户。
-        # 澄清问题以 AIMessage 直接回复用户（替换中间的 [tool-call AIMessage + ToolMessage]）。
-        if has_clarification:
-            writer({"type": THINK_MES, "messages": "📋 需要澄清需求", "trace_id": trace_id})
-            clean_msgs = _clean_clarification_messages(agent_msgs)
-            question = str(clean_msgs[-1].content)[:200] if clean_msgs else ""
-            await track(TrackingType.CLARIFY, TrackingPage.PLAN, model=_request_model(config), p4=question)
-            return {"messages": clean_msgs, "completed": True}
+    # 2) 反思通过：直接给最终答案，并清空旧计划
+    if plan_output and plan_output.action == "complete" and plan_output.answer:
+        out.answer(content=plan_output.answer)
+        await track(TrackingType.PLAN_COMPLETE, TrackingPage.PLAN, model=model, p2="complete", p4=plan_output.answer[:200])
+        return {"messages": [AIMessage(content=plan_output.answer)], "completed": True, "plan_tasks": Overwrite(value=[])}
 
-        # 反思通过：action=complete 且有最终答案 → 作为 AIMessage 追加到 messages 作为回复
-        if plan_output and plan_output.action == "complete" and plan_output.answer:
-            answer_msg = AIMessage(content=plan_output.answer)
-            writer({"type": THINK_MES, "messages": "📋 反思通过，生成最终答案", "trace_id": trace_id})
-            await track(TrackingType.PLAN_COMPLETE, TrackingPage.PLAN, model=_request_model(config), p2="complete", p4=plan_output.answer[:200])
-            # 反思通过后，清空旧计划（若有）。
-            return {"messages": [answer_msg], "completed": True, "plan_tasks": Overwrite(value=[])}
+    # 3) 规划：有子任务 → 注入技能探测（如需）后写回计划
+    if plan_output and plan_output.tasks:
+        subtasks = [_to_subtask(t) for t in plan_output.tasks]
+        skill_ids = [s.skill_id for s in plan_output.skills if s.skill_id] if is_skills_enabled() else []
+        probe_exists = any(t.plan_id == SKILL_PROBE_ID for t in existing_tasks)
+        if skill_ids and (plan_output.action == "create" or not probe_exists):
+            subtasks = _inject_skill_probe(subtasks, skill_ids)
+            out.think(f"📋 命中技能 {skill_ids[0]}，注入上下文探测任务")
+        out.plan(action=plan_output.action, title=plan_output.title, tasks=[t.model_dump() for t in subtasks])
+        out.think(f"📋 规划完成，共 {len(subtasks)} 个子任务")
 
-        # 规划：模型输出了有效计划（有子任务）
-        if plan_output and plan_output.tasks:
-            subtasks = [_to_subtask(t) for t in plan_output.tasks]
-            # 技能命中：机器注入 skill_probe 首任务（create 必注入；update 仅在计划里还没有探测任务时）
-            from app.agents.skills import is_skills_enabled
+        if plan_output.action == "create":
+            await track(TrackingType.PLAN_CREATE, TrackingPage.PLAN, model=model, p1=str(len(subtasks)), p2="create")
+            return {"messages": run.new_messages, "plan_tasks": Overwrite(value=subtasks)}
+        await track(TrackingType.PLAN_UPDATE, TrackingPage.PLAN, model=model, p1=str(len(subtasks)), p2="update")
+        return {"messages": run.new_messages, "plan_tasks": subtasks}
 
-            skills_on = is_skills_enabled()
-            skill_ids = [s.skill_id for s in plan_output.skills if s.skill_id] if skills_on else []
-            probe_exists = any(t.plan_id == SKILL_PROBE_ID for t in existing_tasks)
-            if skill_ids and (plan_output.action == "create" or not probe_exists):
-                subtasks = _inject_skill_probe(subtasks, skill_ids)
-                writer({"type": THINK_MES, "messages": f"📋 命中技能 {skill_ids[0]}，注入上下文探测任务", "trace_id": trace_id})
-            writer(
-                {
-                    "type": THINK_MES,
-                    "messages": f"📋 规划完成，共 {len(subtasks)} 个子任务",
-                    "task_count": len(subtasks),
-                    "trace_id": trace_id,
-                }
-            )
-            # action=create：创建全新计划，整体替换旧计划（无论有无旧任务）。
-            # 提示词约束：create 仅用于「新问题与旧计划不一致」或「无旧计划」时，
-            # 此时旧任务应全部废弃，用 Overwrite 绕过 merge reducer 整体替换。
-            if plan_output.action == "create":
-                await track(TrackingType.PLAN_CREATE, TrackingPage.PLAN, model=_request_model(config), p1=str(len(subtasks)), p2="create")
-                return {"messages": agent_msgs, "plan_tasks": Overwrite(value=subtasks)}
-            # action=update：合并到现有计划，保留旧任务
-            await track(TrackingType.PLAN_UPDATE, TrackingPage.PLAN, model=_request_model(config), p1=str(len(subtasks)), p2="update")
-            return {"messages": agent_msgs, "plan_tasks": subtasks}
+    # 4) 模型直接给了答案但没有子任务：包装成干净 AIMessage（避免内部 dump 上屏）
+    if plan_output and plan_output.answer:
+        out.answer(content=plan_output.answer)
+        return {"messages": [AIMessage(content=plan_output.answer)], "completed": True, "plan_tasks": Overwrite(value=[])}
 
-        # 模型直接给出了最终答案（answer 非空）但没有子任务：
-        # 模型可能输出 action=create/update（未遵守「直接回复用 complete」约定），
-        # 此时若把 agent_msgs 直接写回 state，前端会读到 ToolMessage 的
-        # "Returning structured response: ..." 内部 dump。统一包装成干净 AIMessage。
-        if plan_output and plan_output.answer:
-            answer_msg = AIMessage(content=plan_output.answer)
-            writer({"type": THINK_MES, "messages": "📋 反思通过，生成最终答案", "trace_id": trace_id})
-            return {"messages": [answer_msg], "completed": True, "plan_tasks": Overwrite(value=[])}
+    # 5) 直接回复（澄清、审查结论等）
+    out.think("📋 规划完成")
+    return {"messages": run.new_messages, "completed": True}
 
-        # 没有计划输出 → agent 直接回复（澄清、审查结论等）
-        writer({"type": THINK_MES, "messages": "📋 规划完成", "trace_id": trace_id})
-        return {"messages": agent_msgs, "completed": True}
+
+async def plan_model_node(state: ThreadState, config: RunnableConfig, runtime: Runtime[GraphContext]) -> dict:
+    """规划节点：澄清 → 规划 → 审查（一个节点内完成，输出结构化 PlanOutput）。"""
+    context = runtime.context
+    trace_id = trace_id_ctx_var.get()
+    out = Output("plan_node", trace_id=trace_id)
+    out.think("📋 分析需求，制定执行计划...")
+
+    existing_tasks = state.get("plan_tasks", [])
+    plan_context = _render_plan_status(existing_tasks)
+    messages = await _build_messages(state, context, plan_context)
+    eval_input = _capture_eval_input(messages=messages, plan_context=plan_context, current_time=context.current_time)
+
+    # 节点级重试由 LangGraph retry_policy 接管（见 lead_agent/agent.py）：
+    # 可恢复错误 → raise 重试；不可恢复（欠费/认证）→ 返回友好提示。
+    try:
+        run = await _run_plan_agent(config, messages, out)
+
+        # 统一触发规划评估（覆盖澄清 / 规划 / 直接回复全部分支）
+        eval_input.clarification_requested = run.has_clarification
+        if run.plan_output:
+            eval_input.plan_action = run.plan_output.action
+            eval_input.tasks = [t.model_dump() for t in run.plan_output.tasks]
+        await maybe_evaluate_plan(trace_id=trace_id, eval_input=eval_input, messages=messages, config=config, runtime=runtime)
+
+        return await _apply_plan_result(run=run, existing_tasks=existing_tasks, out=out, config=config, trace_id=trace_id)
 
     except Exception as e:
         retriable, reason = classify_llm_error(e)
         logger.error("Plan 节点失败 (reason={}): {}", reason, e, extra={"trace_id": trace_id})
         if retriable:
-            # 可恢复错误（超时/连接/5xx/429/繁忙）：抛给 LangGraph retry_policy 重试
             raise
-        # 不可恢复错误（欠费/认证/未知）：直接返回友好提示
-        return {"messages": [build_error_fallback_message(e)], "completed": True}
+        message = build_error_fallback_message(e)
+        out.error(str(message.content))
+        return {"messages": [message], "completed": True}
 
 
 def _extract_plan_output(agent_output: dict) -> PlanOutput | None:

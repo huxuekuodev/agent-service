@@ -13,6 +13,22 @@ from langchain.chat_models import BaseChatModel
 from app.core.reflection import resolve_class
 
 
+def _accepts_kwarg(model_class: type, name: str) -> bool:
+    """模型类是否接受某个构建参数（pydantic 字段或 ``__init__`` 形参）。
+
+    用于避免给不支持的渠道类传 ``stream_usage`` 这类参数导致构建直接失败。
+    """
+    fields = getattr(model_class, "model_fields", None)
+    if isinstance(fields, dict) and name in fields:
+        return True
+    try:
+        import inspect
+
+        return name in inspect.signature(model_class).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def create_chat_model(
     name: str | None = None,
     thinking_enabled: bool = False,
@@ -60,6 +76,9 @@ def create_chat_model(
         model_kwargs["timeout"] = instance.timeout
     if instance.max_retries is not None:
         model_kwargs["max_retries"] = instance.max_retries
+    # 流式用量：只有打开才能在 chunk 上拿到 usage_metadata（token 计量/成本统计依赖它）
+    if instance.stream_usage and _accepts_kwarg(model_class, "stream_usage"):
+        model_kwargs.setdefault("stream_usage", True)
     model_kwargs.update(kwargs)
 
     return model_class(**model_kwargs)

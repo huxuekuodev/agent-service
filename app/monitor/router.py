@@ -28,7 +28,7 @@ DEFAULT_FIELD_MEANINGS: dict[str, dict[str, str]] = {
     "plan": {"p0": "plan_id", "p1": "子任务数", "p2": "action", "p3": "耗时(ms)", "p4": "澄清摘要"},
     "execute": {"p0": "task_id", "p1": "agent", "p2": "状态", "p3": "耗时(ms)", "p4": "工具名"},
     "evaluation": {"p0": "评估器", "p1": "指标", "p2": "得分", "p3": "耗时(ms)", "p4": "passed"},
-    "token": {"p0": "总 token", "p1": "输入 token", "p2": "输出 token", "p3": "费用(元)", "p4": ""},
+    "token": {"p0": "总 token", "p1": "输入 token", "p2": "输出 token", "p3": "费用(元)", "p4": "用户 id", "p5": "会话 id", "p6": "模型调用次数", "p7": "缓存命中 token"},
 }
 
 _PAGE_LIST = ["call_model", "chat", "plan", "execute", "evaluation", "knowledge", "system", "token"]

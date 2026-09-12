@@ -17,7 +17,7 @@ API_PORT ?= 8001
 # 默认目标：快速启动前后端
 dev:
 	@echo "==> 启动 API   : http://127.0.0.1:$(API_PORT)（uvicorn --reload）"
-	@echo "==> 启动 Web    : http://127.0.0.1:5173（vite dev，/sessions /monitor /health 代理到 API）"
+	@echo "==> 启动 Web    : http://127.0.0.1:5173（vite dev，/auth /sessions /monitor /health 代理到 API）"
 	@echo "==> Ctrl-C 停止全部"
 	@trap 'kill 0' INT TERM EXIT; \
 	uv run uvicorn app.main:app --reload --port $(API_PORT) & \

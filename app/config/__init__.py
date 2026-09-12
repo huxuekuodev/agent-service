@@ -371,6 +371,81 @@ class DatabaseConfig:
 
 
 @dataclass
+class BusinessDatabaseConfig:
+    """业务库配置（config.yaml ``business_database``）。
+
+    与 ``database``（checkpointer）**分开**：业务库存放用户/会话/消息/监控配置，
+    是"用户可见事实"的长期真相；checkpointer 只管 agent 运行态。
+    建表见 ``deploy/sql/business_schema.sql``，设计见 ``docs/业务库表结构设计.md``。
+    """
+
+    postgres_url: str = ""
+    """业务库连接 URL（建议 .env 用 BUSINESS_DATABASE_URL 注入）；为空表示业务库未接入。"""
+    sessions_page_size: int = 20
+    """会话列表默认分页大小。"""
+    messages_page_size: int = 50
+    """历史消息默认分页大小。"""
+    fail_fast: bool = False
+    """消息落库失败是否阻塞对话：False 仅记日志（对话优先），True 直接报错。"""
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> BusinessDatabaseConfig:
+        d = d or {}
+        return cls(
+            postgres_url=_resolve_env(d.get("postgres_url", "")),
+            sessions_page_size=max(1, int(d.get("sessions_page_size", 20) or 20)),
+            messages_page_size=max(1, int(d.get("messages_page_size", 50) or 50)),
+            fail_fast=bool(d.get("fail_fast", False)),
+        )
+
+    @property
+    def enabled(self) -> bool:
+        """是否已配置业务库（未配置时接口降级：会话/历史不可用）。"""
+        return bool(self.postgres_url.strip())
+
+
+@dataclass
+class AuthConfig:
+    """认证配置（config.yaml ``auth``）：账号密码 + JWT。
+
+    - access token：短时效、无状态校验（只验签 + exp），随请求头 ``Authorization: Bearer`` 传递；
+    - refresh token：长时效、**落库** ``user_tokens``（jti + SHA-256 哈希），支持撤销与旋转
+      （刷新时旧 token 立即置 ``revoked_at``，防重放）。
+    """
+
+    enabled: bool = True
+    """认证总开关；关闭时接口不校验身份（仅本地调试，禁止生产关闭）。"""
+    jwt_secret: str = ""
+    """HS256 签名密钥（.env 用 JWT_SECRET 注入）；为空则认证不可用。"""
+    jwt_algorithm: str = "HS256"
+    access_ttl_minutes: int = 120
+    refresh_ttl_days: int = 30
+    password_min_length: int = 8
+    issuer: str = "deer-agent"
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> AuthConfig:
+        d = d or {}
+        secret = str(_resolve_env(d.get("jwt_secret")) or "")
+        enabled_raw = d.get("enabled")
+        return cls(
+            # 未显式配置 enabled 时：有密钥即启用，避免"配了密钥却忘记开开关"
+            enabled=bool(enabled_raw) if enabled_raw is not None else bool(secret),
+            jwt_secret=secret,
+            jwt_algorithm=str(d.get("jwt_algorithm", "HS256") or "HS256").upper(),
+            access_ttl_minutes=max(1, int(d.get("access_ttl_minutes", 120) or 120)),
+            refresh_ttl_days=max(1, int(d.get("refresh_ttl_days", 30) or 30)),
+            password_min_length=max(6, int(d.get("password_min_length", 8) or 8)),
+            issuer=str(d.get("issuer", "deer-agent") or "deer-agent"),
+        )
+
+    @property
+    def usable(self) -> bool:
+        """认证是否真正可用（开关打开且密钥已配置）。"""
+        return self.enabled and bool(self.jwt_secret)
+
+
+@dataclass
 class YuqueConfig:
     """语雀数据源配置。"""
 
@@ -533,6 +608,12 @@ class AppConfig:
     storage_dir: str = ".deer-agent"
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
 
+    # 业务库（用户/会话/消息/监控配置；与 checkpointer 库分离）
+    business_database: BusinessDatabaseConfig = field(default_factory=BusinessDatabaseConfig)
+
+    # 认证（账号密码 + JWT）
+    auth: AuthConfig = field(default_factory=AuthConfig)
+
     @classmethod
     def from_file(cls, path: str | None = None) -> AppConfig:
         """从 YAML 文件加载配置。"""
@@ -566,6 +647,8 @@ class AppConfig:
             tools=[ToolConfig.from_dict(t) for t in data.get("tools") or []],
             storage_dir=str(data.get("storage_dir", ".deer-agent")),
             database=DatabaseConfig.from_dict(data.get("database")),
+            business_database=BusinessDatabaseConfig.from_dict(data.get("business_database")),
+            auth=AuthConfig.from_dict(data.get("auth")),
             yuque=YuqueConfig.from_dict(data.get("yuque")),
             ingest=KnowledgeIngestConfig.from_dict(data.get("ingest")),
             elasticsearch=ElasticsearchConfig.from_dict(data.get("elasticsearch")),

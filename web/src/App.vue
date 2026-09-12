@@ -3,8 +3,15 @@ import { ref, onMounted, nextTick } from 'vue'
 import Sidebar from './components/Sidebar.vue'
 import ChatArea from './components/ChatArea.vue'
 import MonitorView from './components/MonitorView.vue'
+import LoginView from './components/LoginView.vue'
 import {
+  authMe,
+  authLogout,
   createSession,
+  getMessages,
+  hasToken,
+  getStoredUser,
+  clearAuth,
   listSessions,
   deleteSession,
   chatStream,
@@ -14,68 +21,216 @@ const sessions = ref([])
 const currentId = ref(null)
 const messages = ref([])
 const thinking = ref('')
+const progress = ref([]) // 执行过程（步骤/工具调用）
 const streaming = ref(false)
 const sidebarOpen = ref(false)
 const error = ref('')
 const view = ref('chat') // chat | monitor
 const monitorRef = ref(null)
 
+// 登录态：booting（启动校验中）→ user 非空即已登录
+const user = ref(getStoredUser())
+const booting = ref(true)
+
+// 历史分页：更早消息的游标
+const olderSeq = ref(null)
+const hasOlder = ref(false)
+const loadingOlder = ref(false)
+
+const CURRENT_SESSION_KEY = 'dsh.currentSessionId'
+
 const THINK = 'thinkMessage'
 
-// 会话标题：取第一条用户消息
+// 事件类型（与后端 app/agents/events.py 的 EventType 对齐）
+const EV = {
+  THINK: 'thinkMessage',
+  THINKING: 'thinking',
+  TOOL_CALL: 'tool_call',
+  TOOL_RESULT: 'tool_result',
+  PLAN: 'plan',
+  STEP: 'step',
+  CLARIFY: 'clarify',
+  ANSWER: 'answer',
+  ERROR: 'error',
+}
+
+// 事件 → 进度行（执行过程可视化）
+function progressLine(ev) {
+  switch (ev.type) {
+    case EV.STEP:
+      return `${ev.status === 'started' ? '▶️' : ev.status === 'completed' ? '✅' : '❌'} ${ev.name || ev.plan_id}${ev.detail ? '：' + String(ev.detail).slice(0, 80) : ''}`
+    case EV.TOOL_CALL:
+      return `🔧 调用 ${ev.name}`
+    case EV.TOOL_RESULT:
+      return `${ev.ok === false ? '⚠️' : '📄'} ${ev.name} 返回`
+    case EV.PLAN:
+      return `📋 计划（${ev.action}）：${ev.task_count || 0} 个任务`
+    case EV.CLARIFY:
+      return `❓ ${String(ev.content || '').slice(0, 80)}`
+    case EV.ERROR:
+      return `❌ ${ev.messages || '执行出错'}`
+    default:
+      return ''
+  }
+}
+
+// 会话标题：优先服务端 title，其次首条用户消息
 function titleOf(session) {
   return (session?.title || '').slice(0, 20) || '新会话'
 }
 
+/** 后端会话行 → 侧边栏条目（字段名归一，避免组件里到处判空） */
+function toSessionItem(row) {
+  return {
+    id: row.session_id,
+    title: row.title || '',
+    preview: row.last_preview || '',
+    count: row.message_count || 0,
+    updatedAt: row.last_message_at || row.updated_at || row.created_at || '',
+  }
+}
+
 async function refreshSessions() {
   try {
-    const data = await listSessions()
-    // 后端当前返回空列表（会话注册表未持久化），前端用本地缓存兜底
-    const remote = Array.isArray(data?.sessions) ? data.sessions : []
-    const remoteIds = new Set(remote.map((s) => s.id))
-    const local = sessions.value.filter((s) => !remoteIds.has(s.id))
-    sessions.value = [...local, ...remote]
+    const data = await listSessions({ limit: 50 })
+    sessions.value = (data?.sessions || []).map(toSessionItem)
   } catch (e) {
-    // 列表失败不阻塞使用
+    if (handleAuthError(e)) return
     console.warn('刷新会话列表失败:', e)
   }
+}
+
+/** 认证类错误统一处理：清登录态并回到登录页 */
+function handleAuthError(e) {
+  const status = e?.status
+  if (status === 1200 || status === 1201 || status === 1202) {
+    clearAuth()
+    user.value = null
+    error.value = '登录已失效，请重新登录'
+    return true
+  }
+  return false
 }
 
 async function handleCreate() {
   try {
     const data = await createSession()
-    const id = data?.session_id
-    if (!id) throw new Error('创建会话未返回 session_id')
-    const session = { id, title: '', createdAt: Date.now() }
+    const session = toSessionItem(data)
     sessions.value.unshift(session)
-    await switchSession(id)
+    await switchSession(session.id)
     sidebarOpen.value = false
   } catch (e) {
+    if (handleAuthError(e)) return
     error.value = e.message || '创建会话失败'
   }
 }
 
+/** 切换会话：清空当前视图并拉取该会话历史 */
 async function switchSession(id) {
   currentId.value = id
   messages.value = []
   thinking.value = ''
+  progress.value = []
   error.value = ''
-  // 切会话清空；如后端按 thread 恢复历史，可在此调用历史接口
+  olderSeq.value = null
+  hasOlder.value = false
+  try {
+    localStorage.setItem(CURRENT_SESSION_KEY, id)
+  } catch {
+    /* ignore */
+  }
+  await loadHistory(id)
+}
+
+/** 拉取历史消息（倒序取页、正序返回） */
+async function loadHistory(id, beforeSeq = null) {
+  try {
+    const data = await getMessages(id, { limit: 50, before_seq: beforeSeq })
+    const rows = data?.messages || []
+    const bubbles = rows.map((m) => ({
+      role: m.role === 'user' ? 'user' : 'assistant',
+      content: m.content,
+      kind: m.kind,
+      avatar: m.role === 'user' ? undefined : '🦌',
+      createdAt: m.created_at,
+    }))
+    messages.value = beforeSeq ? [...bubbles, ...messages.value] : bubbles
+    olderSeq.value = data?.before_seq ?? null
+    hasOlder.value = Boolean(data?.has_more)
+  } catch (e) {
+    if (handleAuthError(e)) return
+    error.value = e.message || '加载历史失败'
+  }
+}
+
+async function loadOlder() {
+  if (!currentId.value || !olderSeq.value || loadingOlder.value) return
+  loadingOlder.value = true
+  try {
+    await loadHistory(currentId.value, olderSeq.value)
+  } finally {
+    loadingOlder.value = false
+  }
 }
 
 async function handleDelete(session) {
-  const ok = window.confirm(`确定删除会话「${titleOf(session)}」吗？`)
-  if (!ok) return
+  const confirmed = window.confirm(`确定删除会话「${titleOf(session)}」吗？`)
+  if (!confirmed) return
   try {
     await deleteSession(session.id)
     sessions.value = sessions.value.filter((s) => s.id !== session.id)
     if (currentId.value === session.id) {
       currentId.value = null
       messages.value = []
+      try {
+        localStorage.removeItem(CURRENT_SESSION_KEY)
+      } catch {
+        /* ignore */
+      }
     }
   } catch (e) {
+    if (handleAuthError(e)) return
     error.value = e.message || '删除会话失败'
   }
+}
+
+async function handleLogout() {
+  await authLogout(false)
+  user.value = null
+  sessions.value = []
+  messages.value = []
+  currentId.value = null
+  try {
+    localStorage.removeItem(CURRENT_SESSION_KEY)
+  } catch {
+    /* ignore */
+  }
+}
+
+function onLoginSuccess(profile) {
+  user.value = profile
+  error.value = ''
+  bootstrapWorkspace()
+}
+
+/** 登录后加载工作区：会话列表 + 恢复上次会话 */
+async function bootstrapWorkspace() {
+  await refreshSessions()
+  let saved = ''
+  try {
+    saved = localStorage.getItem(CURRENT_SESSION_KEY) || ''
+  } catch {
+    saved = ''
+  }
+  const target = sessions.value.find((s) => s.id === saved) || sessions.value[0]
+  if (target) await switchSession(target.id)
+  else currentId.value = null
+}
+
+/** 生成消息幂等 id（重发同一 id 不会产生重复消息） */
+function newClientMsgId() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID()
+  return `c-${Date.now()}-${Math.random().toString(16).slice(2)}`
 }
 
 async function handleSend(text) {
@@ -83,26 +238,31 @@ async function handleSend(text) {
     // 无会话时先自动创建
     try {
       const data = await createSession()
-      const id = data?.session_id
-      if (!id) throw new Error('创建会话未返回 session_id')
-      sessions.value.unshift({ id, title: '', createdAt: Date.now() })
-      currentId.value = id
+      sessions.value.unshift(toSessionItem(data))
+      currentId.value = data?.session_id
+      try {
+        localStorage.setItem(CURRENT_SESSION_KEY, currentId.value)
+      } catch {
+        /* ignore */
+      }
     } catch (e) {
+      if (handleAuthError(e)) return
       error.value = e.message || '创建会话失败'
       return
     }
   }
 
-  // 追加用户消息，并更新会话标题
+  // 追加用户消息，并本地先更新标题（服务端首条消息会自动生成标题，流结束后同步）
   messages.value.push({ role: 'user', content: text })
   const s = sessions.value.find((x) => x.id === currentId.value)
-  if (s && !s.title) s.title = text
+  if (s && !s.title) s.title = text.slice(0, 20)
 
   // 准备助手占位
   messages.value.push({ role: 'assistant', content: '', avatar: '🦌' })
   const aiIndex = messages.value.length - 1
 
   thinking.value = ''
+  progress.value = []
   error.value = ''
   streaming.value = true
   await nextTick()
@@ -114,15 +274,35 @@ async function handleSend(text) {
       currentId.value,
       text,
       {
+        clientMsgId: newClientMsgId(),
         onEvent(event) {
           const type = event.type
 
           if (type === 'custom') {
-            // thinkMessage 等业务事件嵌套在 event.data 里
+            // 业务事件嵌套在 event.data 里（见后端 app/agents/events.py）
             const inner = event.data || {}
-            if (inner.type === THINK || inner.type === 'thinking') {
+            if (inner.type === EV.THINK) {
               thinking.value = inner.messages || inner.content || '思考中…'
+              return
             }
+            if (inner.type === EV.THINKING) {
+              // 模型流式增量：追加到思考条（打字机）
+              thinking.value = (thinking.value || '') + (inner.delta || '')
+              return
+            }
+            if (inner.type === EV.ANSWER || inner.type === EV.CLARIFY) {
+              // 事件驱动的最终答复 / 澄清问题：直接落到当前助手气泡
+              const text = inner.content || ''
+              if (text) {
+                messages.value[aiIndex].content = messages.value[aiIndex].content
+                  ? messages.value[aiIndex].content
+                  : text
+              }
+              thinking.value = ''
+              return
+            }
+            const line = progressLine(inner)
+            if (line) progress.value.push(line)
             return
           }
 
@@ -168,6 +348,7 @@ async function handleSend(text) {
           }
         },
         onError(err) {
+          if (handleAuthError(err)) return
           error.value = err?.message || '对话失败'
           if (!messages.value[aiIndex]?.content) {
             messages.value[aiIndex].content = error.value
@@ -182,7 +363,7 @@ async function handleSend(text) {
   } catch (e) {
     streaming.value = false
     thinking.value = ''
-    if (!messages.value[aiIndex]?.content) {
+    if (!handleAuthError(e) && !messages.value[aiIndex]?.content) {
       messages.value[aiIndex].content = e.message || '对话失败'
     }
   }
@@ -191,10 +372,29 @@ async function handleSend(text) {
   if (!gotEnd && !messages.value[aiIndex]?.content) {
     messages.value[aiIndex].content = '(无回复)'
   }
+
+  // 流结束后同步列表（服务端已落库：标题、最后消息预览、消息数）
+  if (user.value) await refreshSessions()
 }
 
-onMounted(() => {
-  refreshSessions()
+onMounted(async () => {
+  if (!hasToken()) {
+    booting.value = false
+    return
+  }
+  try {
+    user.value = await authMe()
+    await bootstrapWorkspace()
+  } catch (e) {
+    if (e?.status === 1200 || e?.status === 1201 || e?.status === 1202) {
+      clearAuth()
+      user.value = null
+    } else {
+      error.value = e?.message || '初始化失败'
+    }
+  } finally {
+    booting.value = false
+  }
 })
 
 function switchView(v) {
@@ -207,15 +407,25 @@ function switchView(v) {
 </script>
 
 <template>
-  <div class="layout">
+  <!-- 启动校验中 -->
+  <div v-if="booting" class="boot">
+    <span>加载中…</span>
+  </div>
+
+  <!-- 未登录：登录 / 注册 -->
+  <LoginView v-else-if="!user" @success="onLoginSuccess" />
+
+  <div v-else class="layout">
     <Sidebar
       v-if="view === 'chat'"
       :sessions="sessions"
       :current-id="currentId"
       :open="sidebarOpen"
+      :user="user"
       @create="handleCreate"
       @select="switchSession"
       @delete="handleDelete"
+      @logout="handleLogout"
       @close="sidebarOpen = false"
     />
 
@@ -235,10 +445,15 @@ function switchView(v) {
       <MonitorView
         v-if="view === 'monitor'"
         ref="monitorRef"
-        :session-id="currentId"
+        :user-id="user?.user_id || ''"
       />
 
       <template v-else>
+        <div v-if="hasOlder" class="older-bar">
+          <button class="older-btn" :disabled="loadingOlder" @click="loadOlder">
+            {{ loadingOlder ? '加载中…' : '↑ 加载更早的消息' }}
+          </button>
+        </div>
         <ChatArea
           :messages="messages"
           :thinking="thinking"
@@ -253,9 +468,37 @@ function switchView(v) {
 </template>
 
 <style scoped>
+.boot {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-2);
+  font-size: 14px;
+}
+
 .layout {
   display: flex;
   height: 100%;
+}
+
+.older-bar {
+  display: flex;
+  justify-content: center;
+  padding: 8px 0 2px;
+}
+
+.older-btn {
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+.older-btn:disabled {
+  opacity: 0.6;
 }
 
 .main {
