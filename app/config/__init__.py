@@ -302,6 +302,10 @@ class SkillSandboxConfig:
     """单条命令默认超时秒数。"""
     max_output_chars: int = 30000
     """单次执行 stdout/stderr 回传给 LLM 的最大字符数（0 = 不截断）。"""
+    session_ttl_seconds: int = 1800
+    """沙箱会话空闲存活秒数：超时未使用则自动销毁（LLM 也可主动 sandbox_close）。"""
+    max_sessions: int = 4
+    """同时存活的沙箱会话数上限（超出时回收最久未用者）。"""
     env_keys: list[str] = field(default_factory=list)
     """允许从宿主环境注入沙箱的环境变量白名单（如 QWEATHER_API_KEY）。"""
     exclude_patterns: list[str] = field(default_factory=lambda: [".env*", "*.pem", "*.key", "*.p12", ".git/*", "__pycache__/*", "*.pyc", ".venv/*", "node_modules/*"])
@@ -320,6 +324,8 @@ class SkillSandboxConfig:
             timeout=int(d.get("timeout", 3600)),
             command_timeout=int(d.get("command_timeout", 120)),
             max_output_chars=int(d.get("max_output_chars", 30000)),
+            session_ttl_seconds=max(60, int(d.get("session_ttl_seconds", 1800) or 1800)),
+            max_sessions=max(1, int(d.get("max_sessions", 4) or 4)),
             env_keys=list(d.get("env_keys") or []),
             exclude_patterns=list(d.get("exclude_patterns") or cls().exclude_patterns),
         )

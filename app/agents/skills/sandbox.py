@@ -1,23 +1,18 @@
-"""E2B 代码沙箱：skill 自带脚本的隔离执行环境（升级版）。
+"""E2B 代码沙箱：技能自带脚本/命令的隔离执行环境。
 
-设计规则（与 main.py 约定一致）：
-  - **skill 自带的脚本**一律在 E2B 沙箱内运行（本地环境不落盘、不执行）；
+设计规则：
+  - **技能自带的脚本**一律在 E2B 沙箱内运行（本地环境不落盘、不执行）；
   - **调用注册工具的步骤**仍在本地执行（工具由执行 agent 注入）；
-  - 沙箱临时、隔离、按需销毁：脚本产生的临时文件随沙箱销毁自动回收，
-    需要保留给用户检查的产物用 ``download_files`` 拉回本地再展示。
+  - 沙箱临时、隔离、按需销毁：产物随沙箱销毁回收，需要留存的产物由技能自己写回
+    结果文本（或后续再加产物拉回能力）。
+
+本模块只负责"一个沙箱"的能力（建/传文件/跑命令/销毁）；
+**跨命令复用与会话回收**在 :mod:`app.agents.skills.session`。
 
 API 备忘（e2b_code_interpreter v1.x，继承自 e2b.Sandbox）:
     - Sandbox.create(template=..., timeout=..., envs={...})
     - sandbox.files.write(path, data) / sandbox.commands.run(cmd, cwd=..., envs=..., timeout=...)
     - sandbox.kill()
-
-升级点（相对草稿）：
-  - 配置驱动：template / 超时 / 输出上限 / 注入 env 白名单 / 跳过模式 来自 config.yaml skills.sandbox；
-  - E2B_API_KEY / e2b 依赖缺失时给出明确错误而非模糊异常；
-  - 同步目录自动过滤敏感文件（.env / 私钥 / .git / 缓存），控制文件数；
-  - 脚本路径限制在已同步的远端根目录内（防越界）；输出截断 + 超时标记；
-  - async 门面（asyncio.to_thread）与一次性执行便捷入口；
-  - 产物拉回（download_files）供人工介入时检查。
 """
 
 from __future__ import annotations
@@ -26,7 +21,7 @@ import asyncio
 import fnmatch
 import logging
 import os
-import shlex
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -39,7 +34,6 @@ __all__ = [
     "SandboxConfig",
     "SkillSandbox",
     "sandbox_available",
-    "run_skill_script_once",
 ]
 
 _DEFAULT_REMOTE_ROOT = "/home/user/skills"
@@ -56,7 +50,7 @@ class SandboxConfig:
     template: str = ""
     timeout: int = 3600
     command_timeout: int = 120
-    max_output_chars: int = 990000
+    max_output_chars: int = 30000
     """单次执行输出回传 LLM 的最大字符数（0 = 不截断）。"""
     env_keys: list[str] = field(default_factory=list)
     exclude_patterns: list[str] = field(default_factory=lambda: [".env*", "*.pem", "*.key", "*.p12", ".git/*", "__pycache__/*", "*.pyc", ".venv/*", "node_modules/*"])
@@ -87,10 +81,14 @@ class SandboxConfig:
             envs.update({k: v for k, v in extra.items() if v is not None})
         return envs
 
+    def is_excluded(self, rel_path: str, name: str) -> bool:
+        """同步到沙箱时是否跳过（敏感文件/缓存）。"""
+        return any(fnmatch.fnmatch(rel_path, pat) or fnmatch.fnmatch(name, pat) for pat in self.exclude_patterns)
+
 
 @dataclass
 class ScriptResult:
-    """一次脚本/命令执行的结果（供 LLM 读取为文本）。"""
+    """一次命令执行的结果（供 LLM 读取为文本）。"""
 
     stdout: str
     stderr: str
@@ -124,7 +122,10 @@ def _import_e2b() -> Any:
 
 
 def sandbox_available() -> tuple[bool, str]:
-    """沙箱是否可用：(可用?, 不可用原因，含修复指引)。"""
+    """沙箱是否可用：(可用?, 不可用原因，含修复指引)。
+
+    只做**环境校验**（配置 + 依赖 + Key），不创建沙箱——用于执行前的前置检查。
+    """
     from app.config import get_app_config
 
     sb = get_app_config().skills.sandbox
@@ -157,16 +158,17 @@ def _classify_sandbox_error(exc: Exception) -> str:
 
 
 class SkillSandbox:
-    """管理一个 E2B 沙箱：同步 skill 文件 + 执行脚本 / 代码 + 拉回产物。
+    """一个 E2B 沙箱：同步技能目录 + 执行命令 + 销毁。
 
-    用法：:
+    用法::
 
-        with SkillSandbox(template="...", envs={"QWEATHER_API_KEY": "..."}) as sb:
-            remote = sb.sync_dir("skills/query_weather")
-            res = sb.run_script(f"{remote}/scripts/get_city_code.py", args=["北京"])
-            print(res.text)
+        sandbox = await SkillSandbox.acreate()
+        remote = await sandbox.async_sync_dir("skills/query-weather")
+        result = await sandbox.arun_command("python3 scripts/get_city_code.py --province 河北省", cwd=remote)
+        print(result.text)
+        await sandbox.aclose()
 
-    Sandbox 的 Python 是同步 API；对外提供 ``arun_*``/``async with`` 门面。
+    Sandbox 的 Python 是同步 API；对外提供 ``a*`` 门面（asyncio.to_thread）。
     """
 
     def __init__(
@@ -212,83 +214,60 @@ class SkillSandbox:
 
     # ------------------------------------------------------------------ 文件同步
 
-    def sync_dir(self, local_dir: str | Path, remote_root: str = _DEFAULT_REMOTE_ROOT) -> str:
-        """把本地目录整棵上传到沙箱（保留相对结构），返回远端目录路径。
+    def sync_dir(self, local_dir: str | Path, remote_root: str = _DEFAULT_REMOTE_ROOT) -> tuple[str, int]:
+        """把本地目录整棵上传到沙箱（保留相对结构）。
+
+        Returns:
+            ``(远端目录, 上传文件数)``。
 
         自动跳过敏感/无关文件（env / 私钥 / .git / 缓存），受 max_files 上限保护。
-        技能脚本内部用 Path(__file__) 锚定同目录数据文件，因此只要结构一致即可。
+        技能脚本内部用 ``Path(__file__)`` 锚定同目录数据文件，因此保持结构一致即可。
         """
         local = Path(local_dir)
         if not local.is_dir():
             raise SkillSandboxError(f"本地目录不存在: {local}")
-        name = local.name
-        dest = f"{remote_root.rstrip('/')}/{name}"
+        dest = f"{remote_root.rstrip('/')}/{local.name}"
         uploaded = 0
         for p in sorted(local.rglob("*")):
             if not p.is_file():
                 continue
             rel = p.relative_to(local).as_posix()
-            if any(fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(p.name, pat) for pat in self._cfg.exclude_patterns):
+            if self._cfg.is_excluded(rel, p.name):
                 continue
-            self.sandbox.files.write(f"{dest}/{rel}", p.read_bytes())
+            try:
+                self.sandbox.files.write(f"{dest}/{rel}", p.read_bytes())
+            except Exception as exc:
+                raise SkillSandboxError(f"同步技能文件失败（{rel}）: {_classify_sandbox_error(exc)}") from exc
             uploaded += 1
             if uploaded >= self._cfg.max_files:
                 logger.warning("同步文件数达上限 %s，截断（%s）", self._cfg.max_files, local)
                 break
         self._remote_roots.append(dest)
         logger.info("[sandbox] 已同步 %d 个文件: %s -> %s", uploaded, local, dest)
-        return dest
+        return dest, uploaded
 
     # ------------------------------------------------------------------ 执行
 
-    @staticmethod
-    def _build_command(remote_script: str, args: list[str] | None) -> str:
-        parts = ["python3", shlex.quote(remote_script)]
-        for a in args or []:
-            parts.append(shlex.quote(str(a)))
-        return " ".join(parts)
-
-    def _assert_script_in_roots(self, remote_script: str) -> None:
-        """脚本路径必须位于本沙箱已同步的远端目录内（防越界执行）。"""
+    def _resolve_cwd(self, cwd: str | None) -> str:
+        """工作目录默认取最近一次同步的根目录；并限制在已同步目录内（防越界）。"""
         if not self._remote_roots:
-            raise SkillSandboxError("尚未同步任何 skill 目录，无法执行远端脚本（请先调用 sync_dir）")
-        if not any(remote_script.startswith(root) for root in self._remote_roots):
-            raise SkillSandboxError(f"远端脚本路径不在已同步目录内（{self._remote_roots}）: {remote_script}")
+            raise SkillSandboxError("沙箱内尚未同步任何技能目录，无法执行命令（请先 sandbox_create）")
+        target = cwd or self._remote_roots[-1]
+        if not any(target == root or target.startswith(f"{root}/") for root in self._remote_roots):
+            raise SkillSandboxError(f"工作目录不在已同步的技能目录内（{self._remote_roots}）: {target}")
+        return target
 
-    def run_script(
+    def run_command(
         self,
-        remote_script: str,
-        args: list[str] | None = None,
-        *,
-        cwd: str | None = None,
-        envs: dict[str, str] | None = None,
-        timeout: float | None = None,
-        allow_outside_roots: bool = False,
-    ) -> ScriptResult:
-        """在沙箱内执行一个已同步的 python 脚本。
-
-        Args:
-            remote_script: 沙箱内脚本绝对路径（由 sync_dir 的返回值拼接）。
-            args: 命令行参数（自动 quote）。
-            cwd/envs/timeout: 命令级覆盖。
-            allow_outside_roots: 是否允许执行已同步目录之外的路径（默认禁止，安全兜底）。
-        """
-        if not allow_outside_roots:
-            self._assert_script_in_roots(remote_script)
-        cmd = self._build_command(remote_script, args)
-        return self._run_command(cmd, cwd=cwd, envs=envs, timeout=timeout)
-
-    def run_code(
-        self,
-        code: str,
+        command: str,
         *,
         cwd: str | None = None,
         envs: dict[str, str] | None = None,
         timeout: float | None = None,
     ) -> ScriptResult:
-        """在沙箱内直接执行一段代码（只跑标准库/模板预装能力）。"""
-        cmd = f"python3 -c {shlex.quote(code)}"
-        return self._run_command(cmd, cwd=cwd, envs=envs, timeout=timeout)
+        """在沙箱内执行一条 shell 命令（脚本、查看文件、自检都用它）。"""
+        workdir = self._resolve_cwd(cwd)
+        return self._run_command(command, cwd=workdir, envs=envs, timeout=timeout)
 
     def _run_command(
         self,
@@ -300,10 +279,11 @@ class SkillSandbox:
     ) -> ScriptResult:
         """执行命令并把结果归一化为 ScriptResult。
 
-        非零退出时 SDK（1.5+）会抛 CommandExitException 且 exception.result 携带
+        非零退出时 SDK（1.5+）会抛 CommandExitException 且异常本身携带
         stdout/stderr/exit_code——必须捕获并取回内容，否则 LLM 只看到一句
         "Command exited with code 2"，看不到脚本打印的用法/原因。
         """
+        started = time.perf_counter()
         try:
             result = self.sandbox.commands.run(
                 cmd,
@@ -311,10 +291,8 @@ class SkillSandbox:
                 envs=self._cfg.resolved_envs(envs) or None,
                 timeout=timeout or self._cfg.command_timeout,
             )
-            return self._to_result(result, timed_out=False)
+            return self._to_result(result, timed_out=False, duration_ms=int((time.perf_counter() - started) * 1000))
         except Exception as exc:
-            # e2b 1.5+：命令非零退出抛 CommandExitException，它本身继承 CommandResult，
-            # stdout/stderr/exit_code 直接挂在异常上——取回完整内容，避免只报 "exit code N"。
             code = getattr(exc, "exit_code", None)
             if code is not None:
                 return ScriptResult(
@@ -323,21 +301,16 @@ class SkillSandbox:
                     exit_code=int(code),
                 )
             low = str(exc).lower()
-            timed_out = "timeout" in low or "timed out" in low
-            if timed_out:
+            if "timeout" in low or "timed out" in low:
                 return ScriptResult(
                     stdout="",
                     stderr=f"沙箱命令执行超时（> {timeout or self._cfg.command_timeout}s，可调大 skills.sandbox.command_timeout）: {exc}",
                     exit_code=-1,
                     timed_out=True,
                 )
-            return ScriptResult(
-                stdout="",
-                stderr=_classify_sandbox_error(exc),
-                exit_code=-1,
-            )
+            return ScriptResult(stdout="", stderr=_classify_sandbox_error(exc), exit_code=-1)
 
-    def _to_result(self, raw: Any, *, timed_out: bool) -> ScriptResult:
+    def _to_result(self, raw: Any, *, timed_out: bool, duration_ms: int = 0) -> ScriptResult:
         # 注意：不要写成 `x or 1` —— 成功退出码 0 会被误判（0 是 falsy）。
         exit_code = getattr(raw, "exit_code", None)
         stdout = str(getattr(raw, "stdout", "") or "")
@@ -349,43 +322,20 @@ class SkillSandbox:
             truncated = True
         if cap and len(stderr) > cap:
             stderr = stderr[:cap] + "\n…[stderr 截断]"
+            truncated = True
         return ScriptResult(
             stdout=stdout,
             stderr=stderr,
             exit_code=int(exit_code) if exit_code is not None else -1,
+            duration_ms=duration_ms,
             timed_out=timed_out,
             truncated=truncated,
         )
 
-    # ------------------------------------------------------------------ 产物拉回
-
-    def download_files(self, remote_globs: list[str], local_dir: str | Path) -> list[Path]:
-        """把沙箱内的产物拉回本地目录（供人工介入时检查/展示）。返回本地路径列表。"""
-        local = Path(local_dir)
-        local.mkdir(parents=True, exist_ok=True)
-        saved: list[Path] = []
-        for rel_glob in remote_globs:
-            # e2b files API 提供 list/read；这里用防御式实现：先 list 再逐个 read
-            try:
-                entries = self.sandbox.files.list("/home/user")  # 按需改造成指定目录
-            except Exception:
-                entries = []
-            for entry in entries or []:
-                name = getattr(entry, "name", "") or str(getattr(entry, "path", ""))
-                if not fnmatch.fnmatch(name, rel_glob):
-                    continue
-                try:
-                    data = self.sandbox.files.read(getattr(entry, "path", name))
-                    out = local / Path(name).name
-                    out.write_bytes(data if isinstance(data, bytes) else str(data).encode())
-                    saved.append(out)
-                except Exception as exc:  # 单个产物失败不影响其余
-                    logger.warning("[sandbox] 拉回产物失败 %s: %s", name, exc)
-        return saved
-
     # ------------------------------------------------------------------ 生命周期
 
     def close(self) -> None:
+        """销毁沙箱（临时产物随之回收）。"""
         if self._closed:
             return
         self._closed = True
@@ -393,7 +343,7 @@ class SkillSandbox:
             self.sandbox.kill()
         except Exception:
             pass
-        logger.info("E2B 沙箱已销毁（临时产物随之回收）")
+        logger.info("E2B 沙箱已销毁")
 
     def __enter__(self) -> SkillSandbox:
         return self
@@ -408,34 +358,12 @@ class SkillSandbox:
         return await asyncio.to_thread(cls, **kwargs)
 
     async def async_sync_dir(self, *args: Any, **kwargs: Any) -> str:
-        return await asyncio.to_thread(self.sync_dir, *args, **kwargs)
+        """同步目录（返回远端目录路径；上传数量见日志）。"""
+        remote, _ = await asyncio.to_thread(self.sync_dir, *args, **kwargs)
+        return remote
 
-    async def arun_script(self, *args: Any, **kwargs: Any) -> ScriptResult:
-        return await asyncio.to_thread(self.run_script, *args, **kwargs)
-
-    async def arun_code(self, *args: Any, **kwargs: Any) -> ScriptResult:
-        return await asyncio.to_thread(self.run_code, *args, **kwargs)
+    async def arun_command(self, *args: Any, **kwargs: Any) -> ScriptResult:
+        return await asyncio.to_thread(self.run_command, *args, **kwargs)
 
     async def aclose(self) -> None:
         await asyncio.to_thread(self.close)
-
-
-async def run_skill_script_once(
-    local_skill_dir: str | Path,
-    script_relpath: str,
-    args: list[str] | None = None,
-    *,
-    envs: dict[str, str] | None = None,
-) -> ScriptResult:
-    """一次性便捷入口：创建沙箱 → 同步 skill 目录 → 执行脚本 → 销毁沙箱。
-
-    Args:
-        local_skill_dir: 本地 skill 目录（scripts 的父级）。
-        script_relpath: 脚本相对 skill 目录的路径（如 scripts/get_city_code.py）。
-    """
-    sandbox = await SkillSandbox.acreate(envs=envs)
-    try:
-        remote = await sandbox.async_sync_dir(local_skill_dir)
-        return await sandbox.arun_script(f"{remote}/{script_relpath.lstrip('/')}", args=args)
-    finally:
-        await sandbox.aclose()

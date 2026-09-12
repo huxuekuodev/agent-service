@@ -53,8 +53,9 @@ async def get_execute_tools(
     """获取 execute 阶段可用的工具。
 
     从 config.yaml ``tools`` 段加载，按 ``allowed_agents`` 过滤出当前 agent 可用的工具；
-    当 skills.enabled=true 时追加技能工具链（list_skills / load_skill / skill_step_detail /
-    run_skill_step / query_error），使执行 agent 能按标准 SOP（skills 仓库）工作。
+    当 skills.enabled=true 时追加技能工具链（list_skills / load_skill / sandbox_create /
+    sandbox_run / sandbox_close / sandbox_list / query_error），使执行 agent 能整份读取技能
+    并在沙箱里完成执行（skills 仓库，见 docs/SKILL_方案.md）。
     关闭开关后不注入技能工具（对比「用/不用 skill」的 token 消耗）。
     配置中无 ``tools`` 段时只返回技能工具链（向后兼容）。
     """

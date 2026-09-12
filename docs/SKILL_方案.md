@@ -14,7 +14,7 @@
 skills/
 └── <skill_id>/                    # 如 yuque-doc-review
     ├── SKILL.md                   # 唯一入口：frontmatter + 角色/能力/步骤大纲
-    ├── SOP.md                     # 标准作业流程：## step-xx + YAML 元数据块，正文即步骤说明
+    ├── reference/                 # 参考文档：脚本参数说明等（load_skill 内联给 LLM）
     ├── errors.yaml                # 错误处理（YAML）：错误码 → 处置(重试/恢复DAG/人工) → 恢复入口
     ├── cleanup.yaml               # 产物清单（YAML）：路径/类型/清理等级(auto|confirm|forbidden)
     └── assets/                    # 模板、脚本、示例（可选，执行时按需读取）
@@ -28,14 +28,16 @@ name: yuque-doc-review
 description: 按标准 SOP 拉取并对比语雀文档历史修订
 when_to_use: 用户要求查看/对比语雀文档某天的修订内容时
 requires_tools: [yuque]            # 校验执行侧工具是否可用
-sop: SOP.md
 errors: errors.yaml
 cleanup: cleanup.yaml
 allowed_agents: [general_agent]
 ---
 ```
 
-**为什么 SKILL.md 内嵌「步骤大纲」而细节放 SOP.md**：规划阶段只需要大纲粒度就能原子化拆 DAG；每步执行细节由执行 agent 按 `{skill_id}/{step}` 二次读取，保证上下文最小、最新。
+**为什么技能是「整体执行单元」而不是步骤集合**：技能内部的脚本调用顺序、参数、错误处置都写在
+SKILL.md 里（连同 reference/ 参考文档），框架不解析、不拆分——执行 agent 用自己的判断在**同一个
+沙箱会话**里跑完整条流程，再由规划节点审查结果。这样既保留了标准做法（可信的脚本与参数），
+又不会因为"一个步骤一个新沙箱"而丢中间状态、也不受框架步骤 schema 的限制。
 
 ## 3. Skill 注册表 / 加载层（`app/agents/skills/`）
 
@@ -43,9 +45,10 @@ allowed_agents: [general_agent]
 app/agents/skills/
 ├── __init__.py        # 对外：match_skills / load_skill_context / get_error_rule / get_cleanup_rules
 ├── registry.py        # 启动时扫描 skills/：解析 frontmatter → SkillMeta[]；校验 requires_tools
-├── loader.py          # 加载 SOP.md / errors.yaml / cleanup.yaml → 数据模型（结构化数据一律 YAML）
-├── models.py          # SkillMeta / SopStep / ErrorRule / CleanupRule
-└── tools.py           # 内置 skill 工具：list_skills / load_skill / skill_step_detail / run_skill_step / query_error
+├── loader.py          # 加载整份 SKILL.md + 文件清单 + errors.yaml/cleanup.yaml（不拆分步骤）
+├── models.py          # SkillMeta / SkillFile / ErrorRule / CleanupRule / SkillContext
+└── tools.py           # 内置 skill 工具：list_skills / load_skill / sandbox_create / sandbox_run /
+                       #                  sandbox_close / sandbox_list / query_error
 ```
 
 - 注册表在每次图构建/规划时刷新（开发期技能可热更）；
@@ -87,7 +90,7 @@ except Exception as exc:
         error_code=classify...)]}   # 扩展 SubTask.error_code
 ```
 
-- SubTask 扩展字段：`skill_id / sop_step / error_code`；
+- SubTask 扩展字段：`skill_id / error_code`（技能整体执行，**没有** sop_step）；
 - ThreadState 扩展 `artifacts`（产物登记表）与 `skill_contexts`；
 - 错误分类复用 `app/agents/errors.py` 的 classify + skill 自定义错误码。
 
@@ -137,14 +140,13 @@ decision = interrupt({
 ```python
 class ThreadState(TypedDict, total=False):
     ...
-    skill_contexts: dict            # skill_id -> {meta, sop_steps, errors_index, cleanup}
+    skill_contexts: dict            # skill_id -> {meta, files, errors_index, cleanup}
     artifacts: Annotated[list[dict], merge_artifacts]   # 产物登记表
     active_skill: str               # 当前主 skill（一次一个主 skill）
 
 class SubTask(BaseModel):
     ...
     skill_id: str = ""              # 命中 skill
-    sop_step: str = ""              # 对应 SOP 步骤
     error_code: str = ""            # failed 原因
     recovery_of: str = ""           # 若为恢复任务，指向被恢复的 plan_id
 ```
@@ -186,23 +188,49 @@ class SubTask(BaseModel):
 ## 10. 落地进度
 
 ### 已完成
-- **框架包 `app/agents/skills/`**：models（SkillMeta/SopStep/ErrorRule/CleanupRule/SkillContext）、
+- **框架包 `app/agents/skills/`**：models（SkillMeta/SkillFile/ErrorRule/CleanupRule/SkillContext）、
   registry（扫描 + frontmatter + 工具依赖校验 + `<SkillsIndex>` 导出）、
-  loader（SOP/errors/cleanup 解析，结构化数据一律 YAML）、sandbox（E2B 升级版）、tools。
-- **E2B 沙箱（升级版）** 与 **技能工具链注入执行 agent**（list_skills / load_skill / skill_step_detail /
-  run_skill_step / query_error 自动追加进 `get_execute_tools()`）：脚本步骤 → 沙箱，工具步骤 → 本地。
+  loader（整份 SKILL.md + 文件清单 + errors/cleanup 解析，结构化数据一律 YAML）、
+  sandbox（E2B：传目录 / 跑命令 / 销毁）、session（沙箱会话：按 skill 复用 + TTL 回收 + 并发串行）、tools。
+- **E2B 沙箱（会话化）** 与 **技能工具链注入执行 agent**（list_skills / load_skill / sandbox_create /
+  sandbox_run / sandbox_close / sandbox_list / query_error 自动追加进 `get_execute_tools()`）：
+  技能脚本 → 沙箱内执行，注册工具 → 本地执行。
 - **配置**：`skills:` 段（dir/cleanup_default/max_candidates/sandbox）；可选依赖 `sandbox = [e2b-code-interpreter]`。
 - **P0 代码接线（本轮）**：
-  - `SubTask` 增加 `skill_id / sop_step / error_code`；
-  - `plan_model_node`：`PlanOutput.skills` 候选（≤3）+ 能力描述末尾拼接 `<SkillsIndex>`
-    （registry.skill_index_text，带工具可用性标注，走既有 `capability_descriptions` 编译变量、无新增占位符）；
-    命中技能时机器注入 `plan_id="skill_probe"` 首任务（create 必注入 / update 在无探测任务时注入），
-    业务任务 deps 自动前缀；review 轮注入 `<SelectedSkill>`（SOP 大纲）与 `<SkillErrors>`（失败任务的技能错误规则）；
-  - `general_agent`：`skill_probe` 由节点确定性执行（校验可用性 + 输出 SOP/错误/清理摘要，不走 LLM）；
+  - `SubTask` 增加 `skill_id / error_code`（一个技能一个任务）；
+  - `plan_model_node`：能力描述末尾拼接 `<SkillsIndex>`（registry.skill_index_text，带工具可用性标注，
+    走既有 `capability_descriptions` 编译变量、无新增占位符）；技能**只由任务上的 `skill_id` 表达**
+    （`PlanOutput` 已无 `skills` 候选字段：技能与任务是同一件事，不再有第二个声明通道）；
+    计划里出现技能任务时机器注入 `plan_id="skill_probe"` 前置校验任务（create 必注入 /
+    update 在无校验任务时注入），业务任务 deps 自动前缀；
+    **不再注入 `<SelectedSkill>` / `<SkillErrors>`**：技能流程由执行侧 `load_skill` 读整份 SKILL.md 获得，
+    错误规则由执行侧 `query_error` + 自行修正处理，规划节点只对"最终 failed"按通用规则决定重试或如实收尾；
+  - `general_agent`：`skill_probe` 由节点确定性执行（**执行前唯一验证点**：技能可用性 + 沙箱环境 +
+    技能文件清单/错误规则，不走 LLM）；技能任务注入整技能执行指引
+    （load_skill → sandbox_create → sandbox_run → 汇总 → sandbox_close）；
     执行异常不再裸抛中断全图 → 返回 `step_statuses="failed"`；
   - `step_fan_out_router`：存在 `failed` 任务时回 `plan_model_node`（恢复 DAG 入口）；
-  - 提示词（本地副本，Langfuse 由人工同步）：plan 提示词新增 SkillsIndex / 技能识别 / 失败反思章节与输出 schema
-    （skills/skill_id/sop_step 字段）；general_agent 提示词新增「技能步骤任务」有界执行指引。
+  - 提示词（运行时唯一来源是 Langfuse；本地文件为备份副本）：plan 提示词新增 SkillsIndex / 技能识别 /
+    失败反思章节与输出 schema（skills/skill_id 字段，**一个技能一个任务，不拆步骤**）；
+    general_agent 提示词新增「技能任务」整技能执行指引（读整份 SKILL → 准备沙箱 → 执行 → 汇总 → 关沙箱）。
+    同步命令：`uv run python scripts/sync_langfuse_prompts.py --all`（`--list` 看差异，`--dry-run` 只预览）。
+
+### 技能执行模型（v2，2026-09 重构）
+
+```
+规划: 命中技能 → 该技能只生成 1 个任务(标注 skill_id) + 系统注入 skill_probe(前置校验)
+执行: load_skill(整份 SKILL.md + reference 文档 + 文件清单 + 错误规则)
+      → sandbox_create(环境校验 + 建沙箱 + 整目录同步)   ← 环境就绪后才有后续
+      → sandbox_run(命令1: 取编码) → sandbox_run(命令2: 查数据) → …（同一沙箱，状态连续）
+      → 汇总结果写回任务 → sandbox_close(显式销毁；未关则由空闲 TTL 回收)
+```
+
+- 为什么去掉 `run_skill_step` / `skill_step_detail`：步骤级工具把技能锁死成框架 schema
+  （args_required/args_hint/step 编号），参数与顺序一旦偏离就空跑或漏传；改为"读文档 + 自己决定命令序列"后，
+  技能作者只要把流程写清楚，模型就能按实际情况调整参数与重试；
+- 沙箱会话为什么按 skill 复用：多步脚本之间有中间状态（编码、下载的数据），一步一沙箱会全部丢失；
+- 资源边界：`skills.sandbox.session_ttl_seconds`（空闲回收，默认 1800s）、`max_sessions`（并发上限，默认 4）、
+  应用关闭时 `aclose_all_sessions()` 兜底；命令超时会直接回收该会话（状态不可信）。
 
 ### 待接入（P0 剩余 → P1）
 - 执行节点产物登记：失败时将产生的临时产物登记进 `ThreadState.artifacts`（SubTask/ThreadState 扩展字段）。

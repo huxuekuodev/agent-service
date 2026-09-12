@@ -10,8 +10,8 @@
 
     {"type": "thinkMessage", "messages": "📋 分析需求，制定执行计划..."}   # 阶段提示（与既有前端兼容）
     {"type": "thinking",     "delta": "..."}                              # 模型流式增量（打字机）
-    {"type": "tool_call",    "name": "run_skill_step", "args": {...}}      # 工具调用
-    {"type": "tool_result",  "name": "run_skill_step", "result": "...", "ok": true}
+    {"type": "tool_call",    "name": "sandbox_run", "args": {...}}          # 工具调用
+    {"type": "tool_result",  "name": "sandbox_run", "result": "...", "ok": true}
     {"type": "plan",         "action": "create", "title": "...", "tasks": [...]}
     {"type": "step",         "plan_id": "task1", "status": "started", "detail": "..."}
     {"type": "clarify",      "content": "问题", "clarification_type": "missing_info", "options": [...]}
@@ -116,10 +116,9 @@ class Output:
         name: str = "",
         detail: str = "",
         skill_id: str = "",
-        sop_step: str = "",
     ) -> None:
         """任务执行状态（开始/完成/失败）。"""
-        self._emit(EventType.STEP, plan_id=plan_id, status=str(status), name=name, detail=_summarize(detail, 300), skill_id=skill_id, sop_step=sop_step)
+        self._emit(EventType.STEP, plan_id=plan_id, status=str(status), name=name, detail=_summarize(detail, 300), skill_id=skill_id)
 
     def tool_call(self, *, name: str, args: Any = None, plan_id: str = "") -> None:
         """工具调用（执行过程可视化）；内部机制类型静默跳过。"""

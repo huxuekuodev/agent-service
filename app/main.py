@@ -89,6 +89,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 await ingest_service.aclose()
             except Exception as exc:
                 logger.warning("知识库摄取服务关闭异常: {}", exc)
+        try:
+            from app.agents.skills import aclose_all_sessions
+
+            closed = await aclose_all_sessions()
+            if closed:
+                logger.info("已回收 {} 个技能沙箱会话", closed)
+        except Exception as exc:
+            logger.warning("技能沙箱会话回收异常: {}", exc)
         for name, closer in (("监控存储", monitor_store.aclose), ("业务库", session_store.aclose)):
             try:
                 await closer()

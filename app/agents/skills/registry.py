@@ -67,9 +67,8 @@ def _load_meta(skill_dir: Path) -> SkillMeta | None:
         description=str(fm.get("description", "") or ""),
         when_to_use=str(fm.get("when_to_use", "") or ""),
         requires_tools=[str(t) for t in (fm.get("requires_tools") or [])],
-        sop_file=str(fm.get("sop", "SOP.md") or "SOP.md"),
-        errors_file=str(fm.get("errors", "errors.md") or "errors.md"),
-        cleanup_file=str(fm.get("cleanup", "cleanup.md") or "cleanup.md"),
+        errors_file=str(fm.get("errors", "errors.yaml") or "errors.yaml"),
+        cleanup_file=str(fm.get("cleanup", "cleanup.yaml") or "cleanup.yaml"),
         has_scripts=(skill_dir / "scripts").is_dir(),
     )
 
@@ -126,7 +125,7 @@ def skill_index_text(max_candidates: int = 3, available_tools: set[str] | None =
     metas = scan_skills()
     if not metas:
         return ""
-    lines = ["## 可用技能（SkillsIndex）：用户需求命中时可选用标准 SOP，规划按步骤原子化拆任务", ""]
+    lines = ["## 可用技能（SkillsIndex）：需求命中时选用标准技能；**一个技能 = 一个执行任务**（不要按步骤拆分，执行 agent 会读完整份 SKILL 自行完成）", ""]
     for meta in metas:
         ok, missing = validate_skill(meta, available_tools or set())
         status = "" if ok else f"（缺工具: {','.join(missing)}，不可用）"

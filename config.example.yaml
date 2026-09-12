@@ -37,6 +37,10 @@ skills:
     template:                # E2B 模板名；留空时读环境变量 E2B_TEMPLATE
     timeout: 3600            # 沙箱最长存活秒数
     command_timeout: 120     # 单条命令默认超时秒数
+    # 沙箱会话空闲存活秒数（超时自动销毁；执行 agent 也可主动 sandbox_close）
+    session_ttl_seconds: 1800
+    # 同时存活的沙箱会话上限
+    max_sessions: 4
     max_output_chars: 30000   # 单次执行输出回传 LLM 的最大字符数（0 = 不截断）
     env_keys: [QWEATHER_API_KEY, QWEATHER_HOST]  # 允许注入沙箱的宿主环境变量白名单（key + 专属域名）
     # exclude_patterns: [.env*, *.pem, *.key, ...]  # 同步时跳过的敏感文件（默认已内置）

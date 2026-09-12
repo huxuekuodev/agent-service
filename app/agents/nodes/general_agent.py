@@ -86,10 +86,10 @@ async def general_agent(state: ThreadState, config: RunnableConfig, runtime: Run
                         计划 ID：{plan_id}\n
                         依赖任务结果：{deps_results}\n
                         <current_time>{runtime.context.current_time}</current_time>"""
-    # 技能步骤任务：直接附上脚本/参数说明，避免执行 agent 因缺少参数而空跑脚本
-    step_guide = await _skill_step_guide(plan_id, plan_tasks)
-    if step_guide:
-        task_info = f"{task_info}\n{step_guide}"
+    # 技能任务：注入整技能执行流程（load_skill → sandbox_create → sandbox_run → 汇总 → sandbox_close）
+    skill_guide = await _skill_task_guide(plan_id, plan_tasks)
+    if skill_guide:
+        task_info = f"{task_info}\n{skill_guide}"
 
     llm = create_llm_with_name(config, model_name="general_node_model")
     # create_agent 的 tools 参数会在内部自动 bind_tools，无需手动绑定
@@ -97,10 +97,10 @@ async def general_agent(state: ThreadState, config: RunnableConfig, runtime: Run
 
     # 执行节点埋点 + 事件：step started / completed / failed（前端步骤卡片与进度）
     current = _find_task(plan_id, plan_tasks)
-    task_skill = {"skill_id": current.skill_id if current else "", "sop_step": current.sop_step if current else ""}
+    task_skill_id = current.skill_id if current else ""
     out = Output("general_agent", trace_id=trace_id)
     out.think(f"▶️ 开始执行：{task_name}")
-    out.step(plan_id=plan_id, name=task_name, status=StepStatus.STARTED, skill_id=task_skill.get("skill_id", ""), sop_step=task_skill.get("sop_step", ""))
+    out.step(plan_id=plan_id, name=task_name, status=StepStatus.STARTED, skill_id=task_skill_id)
 
     role = "general_node_model"
     start = dt.datetime.now().astimezone()
@@ -125,7 +125,7 @@ async def general_agent(state: ThreadState, config: RunnableConfig, runtime: Run
 
     final_msg = agent_msgs[-1] if agent_msgs else AIMessage(content="")
     task_result = final_msg.content if hasattr(final_msg, "content") else str(final_msg)
-    out.step(plan_id=plan_id, name=task_name, status=StepStatus.COMPLETED, detail=str(task_result), **task_skill)
+    out.step(plan_id=plan_id, name=task_name, status=StepStatus.COMPLETED, detail=str(task_result), skill_id=task_skill_id)
 
     # === 2.1 执行节点评估（LLM-as-Judge，非致命）===
     # 评估执行 agent 的工具调用路径效率；未配置 / 被禁用 / 失败时静默跳过，不影响主流程。
@@ -186,62 +186,73 @@ def _text_delta(chunk: Any) -> str:
 
 
 async def _run_skill_probe(plan_tasks: list[SubTask]) -> str:
-    """执行技能上下文探测：校验可用性 + 输出 SOP/错误/清理索引摘要（结果注入下游任务）。"""
+    """技能前置校验：技能可用性 + **沙箱环境**（执行前的唯一验证点）。
+
+    结果注入下游任务，让执行 agent 一开始就知道：技能是否可用、脚本要在沙箱跑、
+    以及整份技能的执行流程（SKILL.md 全文由执行 agent 用 load_skill 自己读）。
+    """
     self_task = next((t for t in plan_tasks if t.plan_id == SKILL_PROBE_ID), None)
     skill_id = self_task.skill_id if self_task else ""
     if not skill_id:
-        return "技能上下文探测跳过：未声明 skill_id"
+        return "技能前置校验跳过：未声明 skill_id"
     try:
         ctx = await load_skill_context_by_id(skill_id)
         if ctx is None:
-            return f"技能「{skill_id}」不存在或上下文加载失败（缺少 SKILL.md？）"
+            return f"技能「{skill_id}」不存在或加载失败（缺少 SKILL.md？）"
         available = {t.name for t in load_config_tools()}
         ok, missing = validate_skill(ctx.meta, available)
-        lines = [f"技能「{skill_id}」校验：{'可用' if ok else '缺工具: ' + ','.join(missing)}", ""]
+        lines = [f"技能「{skill_id}」校验：{'可用' if ok else '缺工具: ' + ','.join(missing)}"]
         if ctx.meta.has_scripts:
             sb_ok, sb_reason = sandbox_available()
-            lines.append(f"沙箱（自带脚本执行）: {'可用' if sb_ok else f'不可用 - {sb_reason}'}")
-            lines.append("")
-        lines.append(ctx.sop_summary())
+            lines.append(f"沙箱环境（自带脚本执行）: {'可用 ✅' if sb_ok else f'不可用 ❌ - {sb_reason}'}")
+            if not sb_ok:
+                lines.append("→ 下游任务必须如实报告沙箱不可用，不要本地执行脚本，也不要编造脚本输出。")
+            else:
+                lines.append(f"→ 下游任务执行流程: load_skill('{skill_id}') 读完整流程 → sandbox_create('{skill_id}') 准备环境 → sandbox_run('{skill_id}', '<命令>') 依次执行 → 汇总结果 → sandbox_close('{skill_id}')")
+        else:
+            lines.append("该技能无自带脚本，按 SKILL.md 的流程使用本地工具完成。")
+        lines.append("")
+        lines.append(f"技能文件清单:\n{ctx.file_index()}")
         if ctx.error_rules:
-            lines += ["", "错误码索引：", ctx.error_index()]
+            lines += ["", "错误处置规则：", ctx.error_index()]
         if ctx.cleanup_rules:
-            lines += ["", "清理规则：", ctx.cleanup_summary()]
+            lines += ["", "产物清理规则：", ctx.cleanup_summary()]
         return "\n".join(lines)
-    except Exception as exc:  # 探测失败不阻塞主流程，下游会看到失败说明
-        logger.warning("技能上下文探测异常 (skill_id=%s): %s", skill_id, exc)
-        return f"技能「{skill_id}」上下文探测异常: {exc}"
+    except Exception as exc:  # 校验失败不阻塞主流程，下游会看到失败说明
+        logger.warning("技能前置校验异常 (skill_id=%s): %s", skill_id, exc)
+        return f"技能「{skill_id}」前置校验异常: {exc}"
 
 
-async def _skill_step_guide(plan_id: str, plan_tasks: list[SubTask]) -> str:
-    """若当前任务带技能步骤标注，返回脚本/参数说明（追加进 task_info）。
+async def _skill_task_guide(plan_id: str, plan_tasks: list[SubTask]) -> str:
+    """技能任务指引：告诉执行 agent 这是一次**完整技能执行**（读 SKILL → 准备沙箱 → 执行 → 汇总）。
 
-    skills.enabled=false 时不注入技能指引。
+    skills.enabled=false 时不注入。
     """
     if not is_skills_enabled():
         return ""
     task = _find_task(plan_id, plan_tasks)
-    if task is None or not task.skill_id or not task.sop_step:
+    if task is None or not task.skill_id:
         return ""
+    skill_id = task.skill_id
     try:
-        ctx = await load_skill_context_by_id(task.skill_id)
+        ctx = await load_skill_context_by_id(skill_id)
         if ctx is None:
-            return ""
-        step = next((s for s in ctx.sop_steps if s.step == task.sop_step), None)
-        if step is None:
-            return ""
-        lines = ["<技能步骤指引>"]
-        if step.script:
-            lines.append(f'本任务执行技能脚本 {step.script}（沙箱运行），通过 run_skill_step("{task.skill_id}", "{task.sop_step}", arguments=[...]) 执行')
-            if step.args_required:
-                lines.append(f"脚本必需参数（arguments 依次为命令行参数）: {step.args_hint or '（见脚本用法）'}")
-            else:
-                lines.append("该脚本无需参数，arguments 可省略")
-        elif step.tool:
-            lines.append(f"本任务应调用注册工具「{step.tool}」完成（本地执行）")
-        # 附上 SOP 步骤说明（含产出要求），避免执行 agent 丢弃关键字段（如城市编码）
-        if step.description:
-            lines.append(f"步骤说明: {step.description[:300]}")
+            return f"<技能任务>技能「{skill_id}」加载失败（缺少 SKILL.md）</技能任务>"
+        lines = [
+            "<技能任务>",
+            f"本任务是一个完整技能的执行：`{skill_id}`（不要按步骤拆分，只做这一个技能）。",
+            f"1. `load_skill('{skill_id}')` 读取整份 SKILL.md（完整流程、脚本用法、产出要求）；",
+            f"2. `sandbox_create('{skill_id}')` 准备沙箱环境（自动同步 scripts/ data/ reference/），确认返回「环境已就绪」；",
+            f"3. `sandbox_run('{skill_id}', '<命令>')` 按 SKILL.md 依次执行脚本（工作目录已是技能目录，用相对路径即可）；",
+            "   命令失败时读 stderr/exit_code 自行修正参数后重试；必要时用 `query_error` 查处置规则；",
+            f"4. 汇总脚本输出为任务结果；完成后 `sandbox_close('{skill_id}')` 释放沙箱。",
+        ]
+        if ctx.scripts:
+            lines.append(f"技能自带脚本: {', '.join(ctx.scripts)}")
+        if ctx.error_rules:
+            lines.append(f"错误规则可用 query_error('{skill_id}', '<错误码>') 查询")
+        lines.append("注意：sandbox_run 只能在沙箱内执行，禁止在本地运行技能脚本。")
+        lines.append("</技能任务>")
         return "\n".join(lines)
     except Exception:
         return ""

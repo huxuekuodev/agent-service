@@ -43,14 +43,6 @@ from app.core.tracking.tracker import track
 from app.llm import create_llm_with_name
 
 
-# 构建 system prompt
-class SkillChoice(BaseModel):
-    """命中的技能候选（模型结构化输出）。"""
-
-    skill_id: str = Field(description="技能 id（须来自 SkillsIndex 且可用），如 query-weather")
-    reason: str = Field(default="", description="命中选择的理由")
-
-
 class PlanTask(BaseModel):
     """计划中的单个子任务（模型结构化输出）。"""
 
@@ -60,8 +52,7 @@ class PlanTask(BaseModel):
     execution_agent: str = Field(default="general_agent", description="执行此任务的 agent")
     sort: int = Field(default=0, description="执行顺序序号")
     deps: list[str] = Field(default_factory=list, description="依赖的子任务 plan_id 列表")
-    skill_id: str = Field(default="", description="该任务所属技能（按技能 SOP 拆解时填写，可选）")
-    sop_step: str = Field(default="", description="该任务对应的技能 SOP 步骤，如 step-01（可选）")
+    skill_id: str = Field(default="", description="该任务执行的技能 id（一个技能=一个任务，整体执行，不拆步骤；可选）")
 
 
 class PlanOutput(BaseModel):
@@ -69,8 +60,7 @@ class PlanOutput(BaseModel):
 
     action: str = Field(description="create: 创建全新计划（替换旧计划）；update: 更新现有计划状态；complete: 反思通过，直接给答案")
     title: str = Field(default="", description="计划标题")
-    skills: list[SkillChoice] = Field(default_factory=list, description="命中的技能候选（≤3，主技能第一个）")
-    tasks: list[PlanTask] = Field(default_factory=list, description="子任务列表")
+    tasks: list[PlanTask] = Field(default_factory=list, description="子任务列表（技能任务在任务上标注 skill_id）")
     answer: str = Field(default="", description="action=complete 时的最终答案文本，其他情况为空字符串")
 
 
@@ -95,7 +85,6 @@ def _to_subtask(t: PlanTask) -> SubTask:
         sort=t.sort,
         deps=t.deps,
         skill_id=t.skill_id,
-        sop_step=t.sop_step,
     )
 
 
@@ -124,24 +113,36 @@ async def _skills_index_text() -> str:
         return ""
 
 
-def _inject_skill_probe(subtasks: list[SubTask], skill_ids: list[str]) -> list[SubTask]:
-    """把「技能上下文探测」作为 DAG 首任务注入，并让业务任务依赖它。
+def _skill_ids_of(subtasks: list[SubTask]) -> list[str]:
+    """计划里出现过的技能 id（按任务顺序去重，主技能即第一个技能任务）。"""
+    seen: list[str] = []
+    for t in subtasks:
+        if t.skill_id and t.skill_id not in seen:
+            seen.append(t.skill_id)
+    return seen
+
+
+def _inject_skill_probe(subtasks: list[SubTask]) -> list[SubTask]:
+    """把「技能前置校验」作为 DAG 首任务注入，并让技能任务依赖它。
+
+    技能由**任务上的 `skill_id`** 表达（模型不再单独声明技能候选）：只要计划里出现了技能任务，
+    就注入一个前置校验任务（技能可用性 + 沙箱环境），让下游任务一开始就知道环境是否可用。
 
     Args:
         subtasks: 模型产出的业务任务。
-        skill_ids: 命中技能候选（主技能在前）。
 
     Returns:
         注入 skill_probe 后的任务列表（业务任务 deps 自动加 skill_probe）。
     """
+    skill_ids = _skill_ids_of(subtasks)
     if not skill_ids:
         return subtasks
     primary = skill_ids[0]
     min_sort = min((t.sort for t in subtasks), default=0)
     probe = SubTask(
         plan_id=SKILL_PROBE_ID,
-        name=f"校验并加载技能「{primary}」上下文",
-        desc=f"[skill_probe] {primary}；候选 {skill_ids}；按 skill 工具链校验可用性并加载 SOP/错误/清理上下文，结果写回本任务",
+        name=f"前置校验技能「{primary}」与沙箱环境",
+        desc=f"[skill_probe] {primary}；本计划涉及技能 {skill_ids}；系统校验技能可用性 + 沙箱环境并注入技能文件清单/错误规则，结果写回本任务",
         execution_agent="general_agent",
         sort=min_sort - 1,
         deps=[],
@@ -149,41 +150,10 @@ def _inject_skill_probe(subtasks: list[SubTask], skill_ids: list[str]) -> list[S
     )
     result: list[SubTask] = [probe]
     for t in subtasks:
-        if not t.skill_id and len(skill_ids) == 1:
-            t.skill_id = primary  # 单主技能时自动标注
         if SKILL_PROBE_ID not in t.deps:
             t.deps = [SKILL_PROBE_ID, *t.deps]
         result.append(t)
     return result
-
-
-async def _skill_error_prompt(existing_tasks: list[SubTask]) -> list[str]:
-    """从已有任务生成 <SkillErrors> 上下文块（供 review/恢复规划）。
-
-    skills.enabled=false 时不注入技能上下文。
-    """
-    from app.agents.skills import is_skills_enabled
-
-    if not is_skills_enabled():
-        return []
-    blocks: list[str] = []
-    skill_ids = {t.skill_id for t in existing_tasks if t.skill_id}
-    if not skill_ids:
-        return blocks
-    from app.agents.skills import load_skill_context_by_id
-
-    errors: list[str] = []
-    for sid in sorted(skill_ids):
-        ctx = await load_skill_context_by_id(sid)
-        if ctx is None:
-            continue
-        failed = [t for t in existing_tasks if t.skill_id == sid and t.step_statuses == "failed"]
-        if failed:
-            errors.append(f"技能 {sid} 错误处理规则：\n{ctx.error_index()}")
-
-    if errors:
-        blocks.append("<SkillErrors>\n" + "\n\n".join(errors) + "\n</SkillErrors>")
-    return blocks
 
 
 @dataclass
@@ -221,7 +191,6 @@ async def _build_messages(state: ThreadState, context: GraphContext, plan_contex
     context_lines: list[str] = []
     if plan_context:
         context_lines.append(f"<PlanStatus>\n当前计划{plan_context}\n\n</PlanStatus>")
-    context_lines.extend(await _skill_error_prompt(state.get("plan_tasks", [])))
     if context_lines:
         messages.append(HumanMessage(content="\n".join(context_lines)))
     if not has_current_time_for_today(user_msgs):
@@ -347,11 +316,11 @@ async def _apply_plan_result(
     # 3) 规划：有子任务 → 注入技能探测（如需）后写回计划
     if plan_output and plan_output.tasks:
         subtasks = [_to_subtask(t) for t in plan_output.tasks]
-        skill_ids = [s.skill_id for s in plan_output.skills if s.skill_id] if is_skills_enabled() else []
+        skill_ids = _skill_ids_of(subtasks) if is_skills_enabled() else []
         probe_exists = any(t.plan_id == SKILL_PROBE_ID for t in existing_tasks)
         if skill_ids and (plan_output.action == "create" or not probe_exists):
-            subtasks = _inject_skill_probe(subtasks, skill_ids)
-            out.think(f"📋 命中技能 {skill_ids[0]}，注入上下文探测任务")
+            subtasks = _inject_skill_probe(subtasks)
+            out.think(f"📋 命中技能 {skill_ids[0]}，注入技能前置校验任务")
         out.plan(action=plan_output.action, title=plan_output.title, tasks=[t.model_dump() for t in subtasks])
         out.think(f"📋 规划完成，共 {len(subtasks)} 个子任务")
 

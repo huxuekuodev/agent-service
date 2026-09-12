@@ -42,7 +42,8 @@ agent-service/
 │   ├── 会话持久化方案.md      # 会话列表/历史回放方案（已定：独立业务库 + 逻辑删除 + 真实用户）
 │   └── 业务库表结构设计.md    # 业务库表结构说明（users/sessions/messages/session_events）
 ├── deploy/sql/business_schema.sql  # 业务库建表 DDL（幂等，可直接执行）
-├── skills/                   # 技能仓库：每子目录一个 skill（SKILL.md/SOP.md/errors.yaml/cleanup.yaml/scripts）
+├── skills/                   # 技能仓库：每子目录一个 skill（SKILL.md + reference/ + data/ + scripts/ + errors/cleanup.yaml）
+├── scripts/                  # 运维脚本：sync_langfuse_prompts.py（本地提示词 → Langfuse 推送）
 ├── tests/                    # 测试（当前基本为空）
 └── app/                      # 主代码
     ├── main.py               # FastAPI 入口；lifespan 管理 AgentService 生命周期
@@ -77,7 +78,9 @@ agent-service/
     │   ├── plan_document.py  # Plan DAG 数据模型（v1 遗留，StepStatus 等）
     │   ├── plan_storage.py   # Plan 存储抽象（内存/Redis 后端，v1 遗留）
     │   ├── plan_toolkit.py   # Plan 工具集 v2：create/update/get_plan_status（ContextVar 桥接）
-    │   ├── skills/           # SKILL 能力：标准 SOP 技能库（registry/loader/sandbox/tools，见 docs/SKILL_方案.md）
+    │   ├── skills/           # SKILL 能力：技能库 + 沙箱会话（registry/loader/sandbox/session/tools，见 docs/SKILL_方案.md）
+    │   │                     # 技能=整体执行单元（任务上标 skill_id）：load_skill 读整份 SKILL →
+    │   │                     # sandbox_create → sandbox_run → sandbox_close；规划节点不再做技能错误恢复
     │   ├── tools/            # 工具注册表（包）：按业务分类组织第三方工具
     │   │   ├── __init__.py   # 对外 API：get_plan_tools / get_execute_tools（自动追加技能工具链）等
     │   │   ├── registry.py   # 从 config `tools` 段加载工具类，按 allowed_agents 过滤
