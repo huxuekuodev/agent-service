@@ -377,6 +377,82 @@ class DatabaseConfig:
 
 
 @dataclass
+class VoiceConfig:
+    """语音通话配置（config.yaml ``voice``）。
+
+    链路：浏览器原生语音识别（STT，见 docs/语音通话方案.md）→ 现有 agent（同一会话/上下文）
+    → **服务端按句流式 TTS** → 浏览器排队播放。TTS 走 OpenAI 兼容的 ``/audio/speech``
+    （当前用硅基流动，复用已有 SILICONFLOW_KEY，零新增依赖）。
+    """
+
+    enabled: bool = True
+    base_url: str = "https://api.siliconflow.cn/v1"
+    """OpenAI 兼容语音接口地址。"""
+    api_key_env: str = "SILICONFLOW_KEY"
+    """语音接口 Key 的环境变量名（不存明文）。"""
+    tts_model: str = "FunAudioLLM/CosyVoice2-0.5B"
+    tts_voice: str = "FunAudioLLM/CosyVoice2-0.5B:alex"
+    chunk_max_chars: int = 60
+    """单块播报文本上限（越大越少切、但单块合成更慢）。"""
+    chunk_min_chars: int = 12
+    """单块下限：更短的句子会并到下一句，避免一顿一顿。"""
+    first_chunk_max_chars: int = 30
+    """首块上限：更短 → 第一声更快（通话体感关键）。"""
+    max_chunks: int = 20
+    """最多合成几块（超出丢弃并提示，完整文字仍在前端）。"""
+    timeout: float = 45.0
+    """单次 TTS 请求超时秒数。"""
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> VoiceConfig:
+        d = d or {}
+        return cls(
+            enabled=bool(d.get("enabled", True)),
+            base_url=str(_resolve_env(d.get("base_url", "https://api.siliconflow.cn/v1")) or "https://api.siliconflow.cn/v1"),
+            api_key_env=str(d.get("api_key_env", "SILICONFLOW_KEY") or "SILICONFLOW_KEY"),
+            tts_model=str(d.get("tts_model", "FunAudioLLM/CosyVoice2-0.5B") or "FunAudioLLM/CosyVoice2-0.5B"),
+            tts_voice=str(d.get("tts_voice", "FunAudioLLM/CosyVoice2-0.5B:alex") or "FunAudioLLM/CosyVoice2-0.5B:alex"),
+            chunk_max_chars=max(20, int(d.get("chunk_max_chars", 60) or 60)),
+            chunk_min_chars=max(4, int(d.get("chunk_min_chars", 12) or 12)),
+            first_chunk_max_chars=max(10, int(d.get("first_chunk_max_chars", 30) or 30)),
+            max_chunks=max(1, int(d.get("max_chunks", 20) or 20)),
+            timeout=float(d.get("timeout", 45.0) or 45.0),
+        )
+
+    @property
+    def api_key(self) -> str:
+        """按 api_key_env 从环境变量取 Key（空 = 未配置，语音不可用）。"""
+        import os
+
+        return os.getenv(self.api_key_env, "") if self.api_key_env else ""
+
+
+@dataclass
+class ApprovalConfig:
+    """人工确认（interrupt）配置（config.yaml ``approval``）。
+
+    计划生成后是否等用户确认再执行；确认卡片里是否展示系统内部任务。
+    关闭 ``plan_review`` 时图不会中断（自动化/压测/脚本调用场景用）。
+    """
+
+    plan_review: bool = True
+    """计划生成后是否中断等待用户确认（False = 直接执行）。"""
+    show_internal_tasks: bool = False
+    """确认卡片是否展示系统内部任务（skill_probe 等）；默认不展示。"""
+    allow_feedback: bool = True
+    """是否允许用户只留言不选选项（留空即照此执行）。"""
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> ApprovalConfig:
+        d = d or {}
+        return cls(
+            plan_review=bool(d.get("plan_review", True)),
+            show_internal_tasks=bool(d.get("show_internal_tasks", False)),
+            allow_feedback=bool(d.get("allow_feedback", True)),
+        )
+
+
+@dataclass
 class BusinessDatabaseConfig:
     """业务库配置（config.yaml ``business_database``）。
 
@@ -620,6 +696,12 @@ class AppConfig:
     # 认证（账号密码 + JWT）
     auth: AuthConfig = field(default_factory=AuthConfig)
 
+    # 人工确认（计划确认中断）
+    approval: ApprovalConfig = field(default_factory=ApprovalConfig)
+
+    # 语音通话（ASR + TTS）
+    voice: VoiceConfig = field(default_factory=VoiceConfig)
+
     @classmethod
     def from_file(cls, path: str | None = None) -> AppConfig:
         """从 YAML 文件加载配置。"""
@@ -655,6 +737,8 @@ class AppConfig:
             database=DatabaseConfig.from_dict(data.get("database")),
             business_database=BusinessDatabaseConfig.from_dict(data.get("business_database")),
             auth=AuthConfig.from_dict(data.get("auth")),
+            approval=ApprovalConfig.from_dict(data.get("approval")),
+            voice=VoiceConfig.from_dict(data.get("voice")),
             yuque=YuqueConfig.from_dict(data.get("yuque")),
             ingest=KnowledgeIngestConfig.from_dict(data.get("ingest")),
             elasticsearch=ElasticsearchConfig.from_dict(data.get("elasticsearch")),

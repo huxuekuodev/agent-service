@@ -4,17 +4,22 @@ import Sidebar from './components/Sidebar.vue'
 import ChatArea from './components/ChatArea.vue'
 import MonitorView from './components/MonitorView.vue'
 import LoginView from './components/LoginView.vue'
+import ConfirmCard from './components/ConfirmCard.vue'
+import CallPanel from './components/CallPanel.vue'
+import { isContinueIntent } from './utils/voice'
 import {
   authMe,
   authLogout,
   createSession,
   getMessages,
+  getSession,
   hasToken,
   getStoredUser,
   clearAuth,
   listSessions,
   deleteSession,
   chatStream,
+  resumeSession,
 } from './api'
 
 const sessions = ref([])
@@ -52,7 +57,21 @@ const EV = {
   CLARIFY: 'clarify',
   ANSWER: 'answer',
   ERROR: 'error',
+  INTERRUPT: 'interrupt',
 }
+
+// 等待用户确认的中断（plan_review 等）：非空时展示确认卡片，输入框交互改走 /resume
+const interrupt = ref(null)
+const confirmBusy = ref(false)
+let pendingResumeText = null
+
+// 语音通话：callState 驱动面板状态，voiceRef 用于把服务端合成的音频交给面板播放
+const inCall = ref(false)
+const callState = ref('listening')
+const voiceRef = ref(null)
+const fallbackSpeech = ref('')
+let currentAbort = null
+//: 本轮待重试的语音（遇到 1103：会话其实在等确认，应改走 /resume 而不是丢弃用户这句话）
 
 // 事件 → 进度行（执行过程可视化）
 function progressLine(ev) {
@@ -140,6 +159,23 @@ async function switchSession(id) {
     /* ignore */
   }
   await loadHistory(id)
+  await syncPendingInterrupt(id)
+}
+
+/** 拉取会话详情里的挂起中断（刷新/切会话后恢复确认卡片） */
+async function syncPendingInterrupt(id) {
+  interrupt.value = null
+  try {
+    const detail = await getSession(id)
+    if (detail?.pending_interrupt) {
+      interrupt.value = {
+        interruptId: detail.pending_interrupt.interrupt_id,
+        payload: detail.pending_interrupt.payload || {},
+      }
+    }
+  } catch (e) {
+    if (!handleAuthError(e)) console.warn('读取待确认状态失败:', e)
+  }
 }
 
 /** 拉取历史消息（倒序取页、正序返回） */
@@ -233,6 +269,239 @@ function newClientMsgId() {
   return `c-${Date.now()}-${Math.random().toString(16).slice(2)}`
 }
 
+/** 处理一条后端 SSE 事件（chat 与 resume 共用） */
+/**
+ * 处理一条后端 SSE 事件（chat 与 resume 共用）。
+ *
+ * 载荷形状有两类，混用会静默失效：
+ *   - `custom`：业务事件**嵌套**在 event.data 里（thinkMessage/plan/step/answer/…）；
+ *   - `interrupt`：嵌套，event.data = {interrupt_id, payload}；
+ *   - `voice_audio` / `voice_unavailable` / `voice_end` / `end`：**扁平**，字段就在 event 上。
+ */
+function applyStreamEvent(event, ctx) {
+  const type = event.type
+  const aiIndex = ctx.aiIndex
+
+  if (type === 'custom') {
+    // 业务事件嵌套在 event.data 里（见后端 app/agents/events.py）
+    const inner = event.data || {}
+    if (inner.type === EV.THINK) {
+      thinking.value = inner.messages || inner.content || '思考中…'
+      return
+    }
+    if (inner.type === EV.THINKING) {
+      // 模型流式增量：追加到思考条（打字机）
+      thinking.value = (thinking.value || '') + (inner.delta || '')
+      return
+    }
+    if (inner.type === EV.ANSWER || inner.type === EV.CLARIFY) {
+      // 事件驱动的最终答复 / 澄清问题：直接落到当前助手气泡
+      const text = inner.content || ''
+      if (text && messages.value[aiIndex]) {
+        messages.value[aiIndex].content = messages.value[aiIndex].content || text
+      }
+      thinking.value = ''
+      return
+    }
+    const line = progressLine(inner)
+    if (line) progress.value.push(line)
+    return
+  }
+
+  if (type === 'messages') {
+    // 增量 token：data 为 [msgChunk, metadata]，取 msgChunk.content 追加
+    const parts = event.data
+    const list = Array.isArray(parts) ? parts : [parts]
+    for (const item of list) {
+      const content = typeof item === 'string' ? item : (item?.content ?? '')
+      if (typeof content === 'string' && content.trim() && messages.value[aiIndex]) {
+        messages.value[aiIndex].content += content
+      }
+    }
+    return
+  }
+
+  if (type === 'values') {
+    // 完整状态快照：最终答案由「新增的 AIMessage」承载，跳过 ToolMessage 等内部消息
+    const data = event.data || {}
+    const msgList = data.messages
+    if (Array.isArray(msgList) && !messages.value[aiIndex]?.content) {
+      for (let i = msgList.length - 1; i >= 0; i--) {
+        const m = msgList[i]
+        if (!m || typeof m.type !== 'string') continue
+        if (m.type === 'HumanMessage') break
+        if (m.type !== 'AIMessage') continue
+        const c = m.content
+        if (typeof c === 'string' && c.trim()) {
+          messages.value[aiIndex].content = c
+          break
+        }
+      }
+    }
+    return
+  }
+
+  if (type === EV.INTERRUPT) {
+    // 运行被挂起：展示确认卡片，等用户答复后走 /resume
+    interrupt.value = {
+      interruptId: event.data?.interrupt_id || '',
+      payload: event.data?.payload || {},
+    }
+    ctx.interrupted = true
+    thinking.value = ''
+    return
+  }
+
+  if (type === 'voice_audio') {
+    // 服务端按句合成的语音块：**载荷是扁平的**（{type,seq,text,format,audio,final}），
+    // 不要照 custom 事件那样读 event.data（那是嵌套结构）——读错会静默没声音。
+    const audio = event.audio || ''
+    const text = event.text || ''
+    if (audio) {
+      voiceRef.value?.enqueueAudio?.(audio, event.format || 'mp3', text)
+    } else if (text) {
+      // 没带音频（服务端某块合成失败）：用浏览器朗读兜底，保证这句话能被听到
+      voiceRef.value?.speakFallback?.(text)
+    } else {
+      console.warn('[voice] voice_audio 事件缺少音频内容', event)
+    }
+    return
+  }
+
+  if (type === 'voice_unavailable') {
+    // 服务端 TTS 不可用：用浏览器内置朗读兜底（免费即时），保证通话不静默
+    const spoken = fallbackSpeech.value
+    if (spoken) voiceRef.value?.speakFallback?.(spoken)
+    return
+  }
+
+  if (type === 'voice_end') {
+    // 队列里可能还有没播完的块：播完由队列自己切回"聆听中"；这里只处理"没有音频可播"的情况
+    if (!voiceRef.value?.isBusy?.()) {
+      callState.value = interrupt.value ? 'awaiting_confirm' : 'listening'
+    }
+    return
+  }
+
+  if (type === 'end') {
+    ctx.gotEnd = true
+  }
+}
+
+/**
+ * 跑一次流（新一轮对话 / 恢复中断），统一处理事件、错误与收尾。
+ *
+ * @param {Object} opts
+ * @param {'chat'|'resume'} opts.kind
+ * @param {string} [opts.text]      新一轮的用户消息
+ * @param {Object} [opts.resume]    { answers, interruptId }
+ */
+async function runStream({ kind, text = '', resume = null, voice = null }) {
+  // 是否要语音播报：默认跟随"当前是否在通话中"——这样新增调用路径不会漏带标记
+  // （曾经卡片确认那条路径漏了 voice，导致"计划确认有语音、结果没有"）
+  const useVoice = voice === null ? inCall.value : Boolean(voice)
+  const sessionId = currentId.value
+  messages.value.push({ role: 'assistant', content: '', avatar: '🦌' })
+  const ctx = { aiIndex: messages.value.length - 1, gotEnd: false, interrupted: false }
+
+  thinking.value = ''
+  progress.value = []
+  error.value = ''
+  streaming.value = true
+  if (kind === 'resume') interrupt.value = null
+  currentAbort = new AbortController()
+  if (useVoice) {
+    callState.value = 'thinking'
+    fallbackSpeech.value = ''
+  }
+  await nextTick()
+
+  const handlers = {
+    signal: currentAbort.signal,
+    onEvent: (event) => {
+      // 记录本轮最终答复文本，供浏览器兜底朗读使用
+      const inner = event.type === 'custom' ? event.data || {} : {}
+      if (inner.type === 'answer' && inner.content) fallbackSpeech.value = inner.content
+      applyStreamEvent(event, ctx)
+    },
+    onError(err) {
+      if (handleAuthError(err)) return
+      if (err?.status === 1103 && kind === 'chat') {
+        // 会话其实在等确认（例如上一轮被打断在确认处）：刷新卡片，并把这句话改成 resume 重发，
+        // 免得用户刚说的话白说
+        error.value = ''
+        pendingResumeText = text
+        syncPendingInterrupt(sessionId)
+        return
+      }
+      error.value = err?.message || '对话失败'
+      if (messages.value[ctx.aiIndex] && !messages.value[ctx.aiIndex].content) {
+        messages.value[ctx.aiIndex].content = error.value
+      }
+    },
+    onFinally() {
+      streaming.value = false
+      thinking.value = ''
+      confirmBusy.value = false
+      if (useVoice && callState.value === 'thinking') callState.value = 'listening'
+    },
+  }
+
+  try {
+    if (kind === 'resume') {
+      await resumeSession(
+        sessionId,
+        { answers: resume?.answers || [], interruptId: resume?.interruptId || '', clientMsgId: newClientMsgId(), voice: useVoice },
+        handlers
+      )
+    } else {
+      await chatStream(sessionId, text, { ...handlers, clientMsgId: newClientMsgId(), voice: useVoice })
+    }
+  } catch (e) {
+    streaming.value = false
+    thinking.value = ''
+    confirmBusy.value = false
+    if (!handleAuthError(e) && messages.value[ctx.aiIndex] && !messages.value[ctx.aiIndex].content) {
+      messages.value[ctx.aiIndex].content = e.message || '对话失败'
+    }
+  }
+
+  if (!ctx.gotEnd && !ctx.interrupted && messages.value[ctx.aiIndex] && !messages.value[ctx.aiIndex].content) {
+    messages.value[ctx.aiIndex].content = '(无回复)'
+  }
+  currentAbort = null
+  if (user.value) await refreshSessions()
+
+  // 1103 重试：拿到挂起中断后，把刚才那句当作确认/意见重新提交
+  if (pendingResumeText !== null) {
+    const retryText = pendingResumeText
+    pendingResumeText = null
+    if (interrupt.value) {
+      const answers = isContinueIntent(retryText) ? [] : [{ id: 'review', selected: [], custom: retryText }]
+      await runStream({ kind: 'resume', resume: { answers, interruptId: interrupt.value.interruptId }, voice: useVoice })
+    }
+  }
+}
+
+/** 打断当前这一轮：停止播报/朗读、中止 SSE，并同步"是否在等确认"（之后可以继续说） */
+async function stopStream() {
+  voiceRef.value?.stopAudio?.()
+  if (currentAbort) {
+    try {
+      currentAbort.abort()
+    } catch {
+      /* ignore */
+    }
+    currentAbort = null
+  }
+  streaming.value = false
+  thinking.value = ''
+  callState.value = 'listening'
+  // 后端可能已经停在"计划确认"上：同步一下，下一次说话才会走 /resume
+  if (currentId.value) await syncPendingInterrupt(currentId.value)
+  if (interrupt.value) callState.value = 'awaiting_confirm'
+}
+
 async function handleSend(text) {
   if (!currentId.value) {
     // 无会话时先自动创建
@@ -257,124 +526,63 @@ async function handleSend(text) {
   const s = sessions.value.find((x) => x.id === currentId.value)
   if (s && !s.title) s.title = text.slice(0, 20)
 
-  // 准备助手占位
-  messages.value.push({ role: 'assistant', content: '', avatar: '🦌' })
-  const aiIndex = messages.value.length - 1
+  await runStream({ kind: 'chat', text })
+}
 
-  thinking.value = ''
-  progress.value = []
+/** 提交确认卡片：留空 = 继续执行；有意见 = 回规划节点重排 */
+async function submitConfirm({ answers }) {
+  if (confirmBusy.value || !currentId.value) return
+  const feedback = (answers?.[0]?.custom || '').trim()
+  confirmBusy.value = true
+  messages.value.push({ role: 'user', content: feedback || '（继续执行）' })
+  await runStream({ kind: 'resume', resume: { answers, interruptId: interrupt.value?.interruptId || '' } })
+}
+
+/** 开始通话（无会话时先建一个，保证语音消息有落点） */
+async function startCall() {
+  if (!currentId.value) await createSessionForVoice()
+  if (!currentId.value) return
+  inCall.value = true
+  callState.value = 'listening'
   error.value = ''
-  streaming.value = true
-  await nextTick()
+}
 
-  let gotEnd = false
-
+async function createSessionForVoice() {
   try {
-    await chatStream(
-      currentId.value,
-      text,
-      {
-        clientMsgId: newClientMsgId(),
-        onEvent(event) {
-          const type = event.type
-
-          if (type === 'custom') {
-            // 业务事件嵌套在 event.data 里（见后端 app/agents/events.py）
-            const inner = event.data || {}
-            if (inner.type === EV.THINK) {
-              thinking.value = inner.messages || inner.content || '思考中…'
-              return
-            }
-            if (inner.type === EV.THINKING) {
-              // 模型流式增量：追加到思考条（打字机）
-              thinking.value = (thinking.value || '') + (inner.delta || '')
-              return
-            }
-            if (inner.type === EV.ANSWER || inner.type === EV.CLARIFY) {
-              // 事件驱动的最终答复 / 澄清问题：直接落到当前助手气泡
-              const text = inner.content || ''
-              if (text) {
-                messages.value[aiIndex].content = messages.value[aiIndex].content
-                  ? messages.value[aiIndex].content
-                  : text
-              }
-              thinking.value = ''
-              return
-            }
-            const line = progressLine(inner)
-            if (line) progress.value.push(line)
-            return
-          }
-
-          if (type === 'messages') {
-            // 增量 token：data 为 [msgChunk, metadata]，取 msgChunk.content 追加
-            const parts = event.data
-            const list = Array.isArray(parts) ? parts : [parts]
-            for (const item of list) {
-              const content =
-                typeof item === 'string' ? item : item?.content ?? ''
-              if (typeof content === 'string' && content.trim()) {
-                messages.value[aiIndex].content += content
-              }
-            }
-            return
-          }
-
-          if (type === 'values') {
-            // 完整状态快照：planner-execute 模式的最终答案由「新增的 AIMessage」承载
-            // （见 plan_model_node return {"messages": [answer_msg], "completed": True}），
-            // 从后往前找最后一个非空的 AI 回复；跳过 ToolMessage 等内部消息
-            // （避免 "Returning structured response: ..." dump 上屏）。
-            const data = event.data || {}
-            const msgList = data.messages
-            if (Array.isArray(msgList) && !messages.value[aiIndex]?.content) {
-              for (let i = msgList.length - 1; i >= 0; i--) {
-                const m = msgList[i]
-                if (!m || typeof m.type !== 'string') continue
-                if (m.type === 'HumanMessage') break // 越过用户消息即止
-                if (m.type !== 'AIMessage') continue // 跳过 ToolMessage 等内部消息
-                const c = m.content
-                if (typeof c === 'string' && c.trim()) {
-                  messages.value[aiIndex].content = c
-                  break
-                }
-              }
-            }
-            return
-          }
-
-          if (type === 'end') {
-            gotEnd = true
-          }
-        },
-        onError(err) {
-          if (handleAuthError(err)) return
-          error.value = err?.message || '对话失败'
-          if (!messages.value[aiIndex]?.content) {
-            messages.value[aiIndex].content = error.value
-          }
-        },
-        onFinally() {
-          streaming.value = false
-          thinking.value = ''
-        },
-      }
-    )
+    const data = await createSession()
+    sessions.value.unshift(toSessionItem(data))
+    currentId.value = data?.session_id
   } catch (e) {
-    streaming.value = false
-    thinking.value = ''
-    if (!handleAuthError(e) && !messages.value[aiIndex]?.content) {
-      messages.value[aiIndex].content = e.message || '对话失败'
-    }
+    if (handleAuthError(e)) return
+    error.value = e.message || '创建会话失败'
   }
+}
 
-  // 兜底：后端若未发出 end，也认为流结束
-  if (!gotEnd && !messages.value[aiIndex]?.content) {
-    messages.value[aiIndex].content = '(无回复)'
+/** 识别到一整句 → 按当前是否等待确认，走 chat 或 resume */
+async function handleVoiceUtterance(text) {
+  if (!text?.trim() || streaming.value) return
+  messages.value.push({ role: 'user', content: text })
+  callState.value = 'thinking'
+  if (interrupt.value) {
+    // 语音确认：说「继续/可以/开始…」= 无意见直接执行；说别的 = 提意见回规划节点重排
+    const answers = isContinueIntent(text) ? [] : [{ id: 'review', selected: [], custom: text }]
+    await runStream({ kind: 'resume', resume: { answers, interruptId: interrupt.value.interruptId }, voice: true })
+  } else {
+    await runStream({ kind: 'chat', text, voice: true })
   }
+  callState.value = interrupt.value ? 'awaiting_confirm' : 'listening'
+}
 
-  // 流结束后同步列表（服务端已落库：标题、最后消息预览、消息数）
-  if (user.value) await refreshSessions()
+/** 通话面板汇报播放状态：正在回答 / 回到聆听 */
+function onCallState(state) {
+  if (interrupt.value) return // 等确认时状态由 interrupt 决定，别被覆盖
+  callState.value = state === 'speaking' ? 'speaking' : 'listening'
+}
+
+function endCall() {
+  inCall.value = false
+  voiceRef.value?.stopAudio?.()
+  callState.value = 'listening'
 }
 
 onMounted(async () => {
@@ -440,6 +648,15 @@ function switchView(v) {
           <button :class="['tab', { active: view === 'monitor' }]" @click="switchView('monitor')">📈 监控</button>
         </div>
         <span v-if="view === 'chat'" class="title">{{ titleOf(sessions.find((s) => s.id === currentId)) }}</span>
+        <button
+          v-if="view === 'chat'"
+          class="call-btn"
+          :class="{ active: inCall }"
+          :title="inCall ? '结束通话' : '语音通话'"
+          @click="inCall ? endCall() : startCall()"
+        >
+          {{ inCall ? '📞 通话中' : '📞 语音通话' }}
+        </button>
       </header>
 
       <MonitorView
@@ -457,10 +674,34 @@ function switchView(v) {
         <ChatArea
           :messages="messages"
           :thinking="thinking"
+          :progress="progress"
           :streaming="streaming"
           @send="handleSend"
-        />
+        >
+          <template #dock>
+            <ConfirmCard
+              v-if="interrupt && !streaming"
+              :payload="interrupt.payload"
+              :busy="confirmBusy"
+              @submit="submitConfirm"
+            />
+          </template>
+        </ChatArea>
       </template>
+
+      <CallPanel
+        v-if="inCall"
+        ref="voiceRef"
+        :active="inCall"
+        :state="interrupt ? 'awaiting_confirm' : callState"
+        :interrupt-payload="interrupt?.payload || null"
+        :title="titleOf(sessions.find((s) => s.id === currentId))"
+        @utterance="handleVoiceUtterance"
+        @hangup="endCall"
+        @confirm="submitConfirm({ answers: [] })"
+        @interrupt="stopStream"
+        @state="onCallState"
+      />
 
       <div v-if="error" class="toast">{{ error }}</div>
     </main>
@@ -551,6 +792,22 @@ function switchView(v) {
 
 .menu-btn:active {
   background: rgba(0, 0, 0, 0.06);
+}
+
+.call-btn {
+  margin-left: auto;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: #fff;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.call-btn.active {
+  background: #e5484d;
+  border-color: #e5484d;
+  color: #fff;
 }
 
 .title {

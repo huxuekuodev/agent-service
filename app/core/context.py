@@ -18,3 +18,6 @@ from contextvars import ContextVar
 
 # 请求级 trace_id — 从前端请求到 agent 执行贯穿全链路
 trace_id_ctx_var: ContextVar[str] = ContextVar("trace_id", default="")
+
+# 请求级「语音通话模式」标记 — 语音场景下节点会调整输出风格（口语化短句，便于朗读）
+voice_mode_ctx_var: ContextVar[bool] = ContextVar("voice_mode", default=False)

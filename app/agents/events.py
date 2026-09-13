@@ -16,6 +16,7 @@
     {"type": "step",         "plan_id": "task1", "status": "started", "detail": "..."}
     {"type": "clarify",      "content": "问题", "clarification_type": "missing_info", "options": [...]}
     {"type": "answer",       "content": "最终答复", "final": true}
+    {"type": "interrupt",    "interrupt_id": "...", "payload": {"type": "plan_review", ...}}
     {"type": "error",        "messages": "..."}
     {"type": "end"}
 """
@@ -49,6 +50,8 @@ class EventType(StrEnum):
     CLARIFY = "clarify"
     ANSWER = "answer"
     ERROR = "error"
+    INTERRUPT = "interrupt"
+    """等待用户确认/答复（对应 LangGraph interrupt；前端渲染确认卡片）。"""
     END = "end"
 
 

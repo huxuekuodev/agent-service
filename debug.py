@@ -55,16 +55,21 @@ async def main():
         runcontext = RunContext(checkpointer=saver, app_config=app_config)
         # 无状态图：全局复用，thread_id 每次传入
         agent = GraphAgent(runcontext)
-        userquery = "查询天气"
+        userquery = "查询北京今天的天气"
         state = {"messages": [HumanMessage(content=userquery)]}
-        thread_id = "debug-thread-39"
+        thread_id = "debug-thread-42"
 
         # 使用成熟的消息打印器
-        await tracker.track("text",page="text",ext=TrackingExt(p0="1"))
         async for chunk in agent.astream(state, thread_id=thread_id, trace_id=trace_id):
-            # printer.handle_chunk(chunk)
             print("###############最外层输出流######################")
-            print(chunk)
+            if chunk["type"] == "updates" :
+                data = chunk["data"]
+                if "__interrupt__" in data:
+                    for intr in data["__interrupt__"]:
+                        print("中断值:", intr.value)   # 字符串形式的 JSON
+                        print("中断 ID:", intr.id)
+            if chunk["type"] == "custom":
+                print(chunk)
     finally:
         if enter_ctx:
             await enter_ctx.__aexit__(None, None, None)

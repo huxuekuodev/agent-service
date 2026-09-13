@@ -19,7 +19,7 @@ from langfuse import Langfuse
 from langfuse.langchain import CallbackHandler
 from langfuse.types import TraceContext
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import RetryPolicy
+from langgraph.types import Command, RetryPolicy
 
 from app.agents.errors import should_retry
 from app.agents.lead_agent import GraphContext
@@ -30,6 +30,10 @@ from app.agents.thread_state import ThreadState
 from app.config import get_app_config
 from app.core.runtime import RunContext
 from app.llm import create_llm
+
+#: 哨兵：区分「没传 resume」与「resume=None」（后者是合法的恢复值）
+_NO_RESUME: Any = object()
+
 
 # 规划节点重试策略：仅对可恢复的 LLM 错误重试（超时/连接/5xx/429/服务繁忙），
 # 欠费/认证失败等不可恢复错误不重试（直接返回友好提示）。
@@ -105,20 +109,24 @@ class GraphAgent:
 
     async def astream(
         self,
-        input_data: dict,
+        input_data: dict | None = None,
         *,
         thread_id: str,
         trace_id: str | None = None,
         model_name: str | None = None,
         usage: Any = None,
+        resume: Any = _NO_RESUME,
     ):
         """流式运行 agent。
 
         Args:
-            messages: 输入消息（dict 或 list 或单条）。
+            input_data: 输入状态（新一轮对话用；``resume`` 已传时忽略）。
             thread_id: 会话线程 ID（按请求传入，决定 checkpointer 恢复哪份状态）。
             trace_id: 追踪 ID。
             model_name: 可选，覆盖默认模型。
+            resume: 恢复被 ``interrupt()`` 挂起的运行（对应 ``Command(resume=...)``）。
+                挂起状态下**不能**用普通输入继续：LangGraph 会带着新输入重跑节点并生成新的
+                interrupt，用户答复会丢失；必须走这个参数。
             usage: 可选的用量采集器（``app.llm.usage.UsageCollector``）。传入后其 callback
                 会挂到本次运行 config 上，自动采集规划/执行/评估的**所有**模型调用；
                 顶层只暴露 ``custom`` 轨，chunk 上的 usage 拿不到，因此必须走 callback。
@@ -126,13 +134,19 @@ class GraphAgent:
         agent = self._build_graph()
         ctx = self.get_context(model_name=model_name)
 
-        for key, default in [
-            ("plan_tasks", []),
-            ("completed", False),
-            ("user_message", ""),
-            ("final_answer", ""),
-        ]:
-            input_data.setdefault(key, default)
+        payload: Any
+        if resume is not _NO_RESUME:
+            # 恢复挂起的运行：Command 原样透传，不能当普通输入做 setdefault
+            payload = Command(resume=resume)
+        else:
+            payload = dict(input_data or {})
+            for key, default in [
+                ("plan_tasks", []),
+                ("completed", False),
+                ("user_message", ""),
+                ("final_answer", ""),
+            ]:
+                payload.setdefault(key, default)
 
         # 每次请求动态构建 config（thread_id 按请求传入）
         configurable: dict[str, Any] = {
@@ -148,8 +162,8 @@ class GraphAgent:
         config["callbacks"] = callbacks
 
         async for st in agent.astream(
-            stream_mode=["custom"],
-            input=input_data,
+            stream_mode=["custom", "updates"],
+            input=payload,
             config=config,
             context=ctx,
             version="v2",

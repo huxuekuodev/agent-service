@@ -219,3 +219,23 @@ auth:
   password_min_length: 8
   issuer: deer-agent
 
+# 人工确认：计划生成后是否等用户确认再执行（前端出确认卡片）
+# 关闭 plan_review 时图不会中断（自动化/脚本调用场景）
+approval:
+  plan_review: true          # 计划生成后中断等待确认
+  show_internal_tasks: false # 确认卡片是否展示系统内部任务（skill_probe 等）
+  allow_feedback: true       # 允许用户只提意见不选选项（留空即照此执行）
+
+# 语音通话（页面内与 agent 语音对话：浏览器识别 → agent → 服务端按句 TTS → 播放）
+# TTS 走 OpenAI 兼容接口（硅基流动，复用 SILICONFLOW_KEY，无需额外账号/依赖）
+voice:
+  enabled: true
+  base_url: https://api.siliconflow.cn/v1
+  api_key_env: SILICONFLOW_KEY          # Key 的环境变量名（不存明文）
+  tts_model: FunAudioLLM/CosyVoice2-0.5B
+  tts_voice: FunAudioLLM/CosyVoice2-0.5B:alex
+  chunk_max_chars: 60                   # 单块播报上限
+  chunk_min_chars: 12                   # 单块下限（短句并到下一句）
+  first_chunk_max_chars: 30             # 首块上限：越小第一声越快
+  max_chunks: 20                        # 最多合成块数
+  timeout: 45                           # 单次 TTS 超时（秒）

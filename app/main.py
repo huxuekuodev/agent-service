@@ -97,6 +97,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 logger.info("已回收 {} 个技能沙箱会话", closed)
         except Exception as exc:
             logger.warning("技能沙箱会话回收异常: {}", exc)
+        try:
+            from app.voice.service import get_voice_service
+
+            await get_voice_service().aclose()
+        except Exception as exc:
+            logger.warning("语音服务释放异常: {}", exc)
         for name, closer in (("监控存储", monitor_store.aclose), ("业务库", session_store.aclose)):
             try:
                 await closer()

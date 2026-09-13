@@ -6,7 +6,14 @@
 
 from __future__ import annotations
 
-from app.agents.nodes.plan_model_node import SKILL_PROBE_ID, PlanOutput, PlanTask, _inject_skill_probe, _skill_ids_of
+from app.agents.nodes.plan_model_node import (
+    SKILL_PROBE_ID,
+    PlanOutput,
+    PlanTask,
+    _inject_skill_probe,
+    _skill_ids_of,
+    _summarize_task_results,
+)
 from app.agents.subtask import SubTask
 
 
@@ -67,3 +74,30 @@ def test_probe_uses_first_skill_as_primary() -> None:
     probe = _inject_skill_probe(tasks)[0]
     assert probe.skill_id == "query-weather"
     assert "yuque-diff" in probe.desc
+
+
+# --------------------------------------------------------------------------- 空输出兜底
+
+
+def test_summarize_results_ignores_internal_and_unfinished_tasks() -> None:
+    """兜底汇总：排除系统内部任务（skill_probe）与未完成/空结果任务。"""
+    tasks = [
+        SubTask(plan_id=SKILL_PROBE_ID, result="技能「query-weather」校验：可用", step_statuses="completed"),
+        SubTask(plan_id="task1", name="查天气", result="北京晴，29℃", step_statuses="completed"),
+        SubTask(plan_id="task2", name="待执行", result="", step_statuses="not_started"),
+        SubTask(plan_id="task3", name="进行中", result="半截结果", step_statuses="in_progress"),
+    ]
+    assert _summarize_task_results(tasks) == "北京晴，29℃"
+
+
+def test_summarize_results_multiple_and_capped() -> None:
+    tasks = [SubTask(plan_id=f"task{i}", name=f"任务{i}", result=f"结果{i}", step_statuses="completed") for i in range(1, 9)]
+    summary = _summarize_task_results(tasks, max_items=3)
+    assert "结果1" in summary and "结果3" in summary and "结果4" not in summary
+    assert "另有 5 项未列出" in summary
+
+
+def test_summarize_results_empty_when_nothing_useful() -> None:
+    assert _summarize_task_results([]) == ""
+    assert _summarize_task_results([SubTask(plan_id="task1", result="", step_statuses="completed")]) == ""
+    assert _summarize_task_results([SubTask(plan_id=SKILL_PROBE_ID, result="内部校验文本", step_statuses="completed")]) == ""

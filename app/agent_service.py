@@ -12,11 +12,13 @@ import uuid
 from typing import Any
 
 from langchain_core.messages import HumanMessage
+from langgraph.types import Overwrite
 
+from app.agents.interrupts import INTERRUPT_EVENT_TYPE, extract_interrupt
 from app.agents.lead_agent.agent import GraphAgent
 from app.config import get_app_config
 from app.core.checkpointer import create_checkpointer
-from app.core.context import trace_id_ctx_var
+from app.core.context import trace_id_ctx_var, voice_mode_ctx_var
 from app.core.log import logger
 from app.core.runtime import RunContext
 
@@ -68,6 +70,25 @@ def _normalize_stream_event(chunk: Any) -> dict | None:
         return {"type": chunk.get("type", "values"), "data": chunk}
 
     return None
+
+
+def _translate_event(event: dict) -> dict | None:
+    """把归一化事件翻译成对外事件；不对外暴露的事件返回 None。
+
+    ``updates`` 通道里藏着 ``__interrupt__``（LangGraph 的挂起信号）与内部状态更新：
+    中断要转成前端可见的 ``interrupt`` 事件，其余状态更新不外发（避免内部消息上屏）。
+    """
+    if event.get("type") != "updates":
+        return event
+    found = extract_interrupt(event)
+    if found is None:
+        return None
+    interrupt_id, payload = found
+    return {"type": INTERRUPT_EVENT_TYPE, "data": {"interrupt_id": interrupt_id, "payload": payload}}
+
+
+#: 哨兵：区分「没传 resume」与「resume=None」（后者是合法的恢复值）
+_NO_RESUME: Any = object()
 
 
 class AgentService:
@@ -164,33 +185,160 @@ class AgentService:
                 messages.append({"type": "custom", "data": event.get("data")})
         return messages
 
-    async def stream(self, thread_id: str, message: str, *, usage: Any = None):
-        """发送消息并流式返回事件。
+    async def stream(
+        self,
+        thread_id: str,
+        message: str | None = None,
+        *,
+        resume: Any = _NO_RESUME,
+        usage: Any = None,
+        voice: bool = False,
+    ):
+        """发送消息（或恢复中断）并流式返回事件。
 
         将 LangGraph 的原始流归一化为统一事件::
 
-            {"type": "values" | "messages" | "custom", "data": ...}
+            {"type": "custom" | "interrupt", "data": ...}
 
-        当前图只暴露 ``custom`` 轨（见 ``GraphAgent.astream``），前端渲染依赖其中的
-        业务事件；模型 token 增量与用量走 ``usage`` 采集器（callback）。
+        - ``custom``：节点业务事件（前端渲染进度/答复）；
+        - ``interrupt``：运行被 ``interrupt()`` 挂起，``data = {"interrupt_id", "payload"}``，
+          前端据此渲染确认卡片，用户答复后用 ``resume=`` 再次调用本方法继续。
 
         Args:
             thread_id: 会话 ``checkpoint_thread_id``（默认等于 session_id）。
-            message: 用户消息。
-            usage: 可选用量采集器（``app.llm.usage.UsageCollector``），本次请求结束后读总数。
+            message: 用户消息（新一轮对话；``resume`` 已传时可省略）。
+            resume: 恢复挂起的运行（``Command(resume=<用户答复>)``）。
+            usage: 可选用量采集器（``app.llm.usage.UsageCollector``）。
+            voice: 是否语音通话模式（节点会改用口语化短句回答，便于朗读）。
         """
         agent = self._require_agent()
         trace_id = trace_id_ctx_var.get() or uuid.uuid4().hex
-        state = {"messages": [HumanMessage(content=message)]}
-        async for st in agent.astream(
-            state,
-            thread_id=thread_id,
-            trace_id=trace_id,
-            usage=usage,
-        ):
-            event = _normalize_stream_event(st)
-            if event is not None:
+        token = voice_mode_ctx_var.set(bool(voice))
+
+        try:
+            async for event in self._stream_events(agent, thread_id, message, trace_id=trace_id, usage=usage, resume=resume):
                 yield event
+        finally:
+            voice_mode_ctx_var.reset(token)
+
+    async def _stream_events(self, agent: GraphAgent, thread_id: str, message: str | None, *, trace_id: str, usage: Any, resume: Any):
+        """真正跑图并翻译事件（voice 模式只影响上下文，不影响这里）。"""
+        if resume is _NO_RESUME:
+            state: Any = {"messages": [HumanMessage(content=message or "")]}
+            async for st in agent.astream(state, thread_id=thread_id, trace_id=trace_id, usage=usage):
+                event = _normalize_stream_event(st)
+                if event is None:
+                    continue
+                translated = _translate_event(event)
+                if translated is not None:
+                    yield translated
+            return
+
+        async for st in agent.astream(None, thread_id=thread_id, trace_id=trace_id, usage=usage, resume=resume):
+            event = _normalize_stream_event(st)
+            if event is None:
+                continue
+            translated = _translate_event(event)
+            if translated is not None:
+                yield translated
+
+    async def prepare_turn(self, thread_id: str) -> dict[str, Any] | None:
+        """新一轮对话开始前的一次状态检查（一次读取，做两件事）：
+
+        1. 有挂起中断 → 返回它（调用方应拒绝 /chat，引导走 /resume）；
+        2. 有卡在 ``in_progress`` 的任务 → **复位为 not_started**（上一轮被用户打断留下的），
+           否则沿用旧计划时会看到一批"永远进行中"的任务，dispatch 既不重跑也无法判定完成。
+
+        Returns:
+            ``{"interrupt_id", "payload", "next"}`` 或 None。
+        """
+        try:
+            graph = self._require_agent()._build_graph()
+            config = {"configurable": {"thread_id": thread_id}}
+            snapshot = await graph.aget_state(config)
+        except Exception as exc:
+            logger.warning("读取会话状态失败: thread={} err={}", thread_id, exc)
+            return None
+
+        interrupts = list(getattr(snapshot, "interrupts", None) or [])
+        if interrupts:
+            found = extract_interrupt({"type": "updates", "data": {"__interrupt__": interrupts}})
+            if found is None:
+                return None
+            interrupt_id, payload = found
+            return {"interrupt_id": interrupt_id, "payload": payload, "next": list(getattr(snapshot, "next", ()) or [])}
+
+        # 没有挂起：清理上一轮被打断留下的 in_progress 任务（自愈）
+        await self._reset_inflight(thread_id, getattr(snapshot, "values", None) or {})
+        return None
+
+    async def _reset_inflight(self, thread_id: str, values: dict[str, Any]) -> int:
+        """把 ``in_progress`` 任务复位为 ``not_started``（合并 reducer 视 not_started 为"没写"，
+        因此必须用 Overwrite 整体替换）。"""
+        tasks = list(values.get("plan_tasks") or [])
+        inflight = [t for t in tasks if t.step_statuses == "in_progress"]
+        if not inflight:
+            return 0
+        fixed = [t.model_copy(update={"step_statuses": "not_started"}) if t.step_statuses == "in_progress" else t for t in tasks]
+        try:
+            graph = self._require_agent()._build_graph()
+            await graph.aupdate_state({"configurable": {"thread_id": thread_id}}, {"plan_tasks": Overwrite(value=fixed)})
+            logger.info("已复位上一轮被打断的任务: thread={} 数量={}", thread_id, len(inflight))
+        except Exception as exc:
+            logger.warning("复位被打断任务失败: thread={} err={}", thread_id, exc)
+            return 0
+        return len(inflight)
+
+    async def reset_inflight_tasks(self, thread_id: str) -> int:
+        """把卡在 ``in_progress`` 的任务复位为 ``not_started``（用户打断后清理）。
+
+        为什么要它：图运行被用户中途打断时，任务可能已经标记 in_progress 却没跑完；
+        下次请求若走 update（沿用旧计划）就会看到一批"永远进行中"的任务，
+        dispatch 既不会重跑它们、也无法判定全部完成 → 会话假死。
+        复位后下一轮可以正常重新派发。
+
+        注意用 ``Overwrite`` 整体替换：合并 reducer 把 ``not_started`` 视为"没写"（防误重置），
+        普通更新到不了这里。
+
+        Returns:
+            被复位的任务数。
+        """
+        try:
+            graph = self._require_agent()._build_graph()
+            config = {"configurable": {"thread_id": thread_id}}
+            snapshot = await graph.aget_state(config)
+            tasks = list((getattr(snapshot, "values", None) or {}).get("plan_tasks") or [])
+            inflight = [t for t in tasks if t.step_statuses == "in_progress"]
+            if not inflight:
+                return 0
+            fixed = [t.model_copy(update={"step_statuses": "not_started"}) if t.step_statuses == "in_progress" else t for t in tasks]
+            await graph.aupdate_state(config, {"plan_tasks": Overwrite(value=fixed)})
+            logger.info("已复位被打断的任务: thread={} 数量={}", thread_id, len(inflight))
+            return len(inflight)
+        except Exception as exc:
+            logger.warning("复位被打断任务失败: thread={} err={}", thread_id, exc)
+            return 0
+
+    async def pending_interrupt(self, thread_id: str) -> dict[str, Any] | None:
+        """查询该 thread 是否有挂起的中断（前端刷新后恢复确认卡片用）。
+
+        Returns:
+            ``{"interrupt_id": ..., "payload": {...}}``；无挂起返回 None。
+        """
+        try:
+            graph = self._require_agent()._build_graph()
+            snapshot = await graph.aget_state({"configurable": {"thread_id": thread_id}})
+        except Exception as exc:
+            logger.warning("读取挂起中断失败: thread={} err={}", thread_id, exc)
+            return None
+        interrupts = list(getattr(snapshot, "interrupts", None) or [])
+        if not interrupts:
+            return None
+        payload = extract_interrupt({"type": "updates", "data": {"__interrupt__": interrupts}})
+        if payload is None:
+            return None
+        interrupt_id, value = payload
+        return {"interrupt_id": interrupt_id, "payload": value, "next": list(getattr(snapshot, "next", ()) or [])}
 
     # ------------------------------------------------------------------
     # 内部

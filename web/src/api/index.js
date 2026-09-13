@@ -245,24 +245,22 @@ export function chatSync(sessionId, message, clientMsgId = null) {
 }
 
 /**
- * SSE 流式对话。
- * 后端每条事件都是统一信封：{ data, msg, status }
- *   - status 200：data 为业务事件（type: thinkMessage | values | messages | end）
+ * SSE 流式请求（/chat 与 /resume 共用）。后端每条事件都是统一信封：{ data, msg, status }
+ *   - status 200：data 为业务事件（thinkMessage | plan | step | tool_call | answer | interrupt | end）
  *   - status >= 1000：出错，msg 为提示
  *
- * @param {string} sessionId
- * @param {string} message
+ * @param {string} path    相对于 /sessions 的路径
+ * @param {Object} body    请求体
  * @param {Object} handlers
- * @param {(event: Object) => void} handlers.onEvent  每条业务事件
+ * @param {(event: Object) => void} handlers.onEvent
  * @param {(err: Error) => void} handlers.onError
  * @param {() => void} [handlers.onFinally]
- * @param {AbortSignal} [signal]
- * @param {string} [clientMsgId] 消息幂等 id（重发不产生重复消息）
+ * @param {AbortSignal} [handlers.signal]
  */
-export async function chatStream(sessionId, message, { onEvent, onError, onFinally, signal, clientMsgId = null } = {}) {
-  const payload = JSON.stringify({ message, client_msg_id: clientMsgId })
+async function streamSse(path, body, { onEvent, onError, onFinally, signal } = {}) {
+  const payload = JSON.stringify(body)
   const send = () =>
-    fetch(`${BASE}/${sessionId}/chat`, {
+    fetch(`${BASE}${path}`, {
       method: 'POST',
       headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: payload,
@@ -327,6 +325,34 @@ export async function chatStream(sessionId, message, { onEvent, onError, onFinal
   } finally {
     onFinally?.()
   }
+}
+
+/**
+ * SSE 流式对话（新一轮用户消息）。
+ *
+ * @param {string} sessionId
+ * @param {string} message
+ * @param {Object} handlers onEvent / onError / onFinally / signal / clientMsgId
+ */
+export function chatStream(sessionId, message, { clientMsgId = null, voice = false, ...handlers } = {}) {
+  return streamSse(`/${sessionId}/chat`, { message, client_msg_id: clientMsgId, voice }, handlers)
+}
+
+/**
+ * 恢复被挂起的中断（interrupt → resume）。
+ *
+ * 挂起状态下必须用它而不是 chatStream：用新消息调 /chat 不会消费挂起
+ * （后端会返回 1103 拦截），用户的答复会被丢弃。
+ *
+ * @param {string} sessionId
+ * @param {Object} payload
+ * @param {Array<{id?: string, selected?: string[], custom?: string}>} payload.answers
+ * @param {string} [payload.interruptId] 确认卡片对应的中断 id（校验卡片是否过期）
+ * @param {string} [payload.clientMsgId]
+ * @param {Object} handlers onEvent / onError / onFinally / signal
+ */
+export function resumeSession(sessionId, { answers = [], interruptId = '', clientMsgId = null, voice = false } = {}, handlers = {}) {
+  return streamSse(`/${sessionId}/resume`, { answers, interrupt_id: interruptId, client_msg_id: clientMsgId, voice }, handlers)
 }
 
 // ---------------------------------------------------------------------------

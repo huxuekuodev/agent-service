@@ -68,6 +68,8 @@ watch(
       </div>
     </div>
 
+    <slot name="dock" />
+
     <div class="composer">
       <div class="input-wrap">
         <textarea

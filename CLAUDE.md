@@ -40,6 +40,8 @@ agent-service/
 │   ├── SKILL_方案.md         # SKILL（标准 SOP + 沙箱执行 + 人工介入）设计文档
 │   ├── 消息流转与展示方案.md  # Plan 节点 transcript / UI 双轨（append-only 保 KV 缓存）方案
 │   ├── 会话持久化方案.md      # 会话列表/历史回放方案（已定：独立业务库 + 逻辑删除 + 真实用户）
+│   ├── 中断与恢复方案.md      # 人工确认（interrupt）与 /resume 恢复协议、合并语义
+│   ├── 语音通话方案.md        # 页内语音通话（浏览器识别 + 服务端按句流式 TTS）设计
 │   └── 业务库表结构设计.md    # 业务库表结构说明（users/sessions/messages/session_events）
 ├── deploy/sql/business_schema.sql  # 业务库建表 DDL（幂等，可直接执行）
 ├── skills/                   # 技能仓库：每子目录一个 skill（SKILL.md + reference/ + data/ + scripts/ + errors/cleanup.yaml）
@@ -47,7 +49,7 @@ agent-service/
 ├── tests/                    # 测试（当前基本为空）
 └── app/                      # 主代码
     ├── main.py               # FastAPI 入口；lifespan 管理 AgentService 生命周期
-    ├── agent_service.py      # 会话/对话服务层；无状态图 + 共享 checkpointer
+    ├── agent_service.py      # 会话/对话服务层；无状态图 + 共享 checkpointer + resume/pending_interrupt
     ├── config/
     │   ├── __init__.py       # AppConfig 等配置数据类；从 config.yaml 加载（惰性单例）
     │   └── agents.py         # agent 名校验（validate_agent_name）
@@ -56,6 +58,9 @@ agent-service/
     │   ├── tokens.py         # JWT 签发/校验（HS256 白名单，access/refresh + jti）
     │   ├── service.py        # AuthService：注册/登录/刷新（旋转）/登出/改密
     │   └── deps.py           # FastAPI 依赖 current_user / optional_user
+    ├── voice/                # 语音通话：播报文本分句 + 服务端 TTS（见 docs/语音通话方案.md）
+    │   ├── audio.py          # 清洗 Markdown + 分句切块（首块短、短句合并、超长硬切）
+    │   └── service.py        # TTS（OpenAI 兼容 /audio/speech，按句流式；含失效连接重试）
     ├── session/              # 会话持久化（业务库）
     │   ├── store.py          # 业务库连接池 + users/user_tokens/sessions/messages CRUD（唯一 SQL 出口）
     │   └── service.py        # SessionService（会话编排 + AssistantReplyCollector 回复收集）
@@ -75,6 +80,7 @@ agent-service/
     ├── agents/
     │   ├── thread_state.py   # LangGraph 线程状态定义（messages + plan_tasks，reducer）
     │   ├── subtask.py        # SubTask 数据模型（DAG 子任务）
+    │   ├── interrupts.py     # 中断/恢复协议：build_ask 载荷 + answers 解析（多问题可扩展）
     │   ├── plan_document.py  # Plan DAG 数据模型（v1 遗留，StepStatus 等）
     │   ├── plan_storage.py   # Plan 存储抽象（内存/Redis 后端，v1 遗留）
     │   ├── plan_toolkit.py   # Plan 工具集 v2：create/update/get_plan_status（ContextVar 桥接）
@@ -111,7 +117,7 @@ agent-service/
     │       └── general_evaluator.py # GeneralEvaluator：执行节点路径效率（1-5 分）
     ├── routers/
     │   ├── auth.py           # 认证接口（register/login/refresh/logout/me/password）
-    │   ├── sessions.py       # 会话与对话接口（增删改查/历史/chat SSE/chat sync，JWT 鉴权 + 落库）
+    │   ├── sessions.py       # 会话与对话接口（增删改查/历史/chat SSE/chat sync/resume，JWT 鉴权 + 落库）
     │   └── health.py         # 健康检查
     ├── monitor/              # 监控平台后端（/monitor/*）：组件配置/字段含义/用户token（PG）+
     │   │                     # 打点数据聚合查询（store.py / query.py / router.py）
@@ -126,7 +132,7 @@ agent-service/
 
 ## 配置入口
 
-`config.yaml` 是唯一配置源（路径优先级：显式 `config_path` > `AGENT_CONFIG_PATH` > `./config.yaml`），支持 `$ENV` 变量引用 `.env` 中的密钥。关键段：`models`（模型角色 → LLM 实例名映射，实例见 `app/llm/instances/`，每个实例只配置一套）、`langfuse`（追踪开关）、`tracking`（打点独立数据日志，默认 `logs/tracking.data`，不写入 app.log）、`token_pricing`（Token 计费：模型角色 → 输入/输出单价，元 / 1K tokens）、`skills`（技能库目录 + `enabled` 总开关 + E2B 沙箱执行配置，见 docs/SKILL_方案.md）、`plan_evaluation`（旧评估配置，向后兼容）、`evaluators`（推荐的可插拔评估器列表）、`subagents`、`database`（checkpointer：`memory` / `postgres`）、`business_database`（**业务库**：用户/会话/消息/监控配置，`$BUSINESS_DATABASE_URL`，建表 `deploy/sql/business_schema.sql`，见 docs/业务库表结构设计.md）、`auth`（账号密码 + JWT：`jwt_secret` / `access_ttl_minutes` / `refresh_ttl_days`）。
+`config.yaml` 是唯一配置源（路径优先级：显式 `config_path` > `AGENT_CONFIG_PATH` > `./config.yaml`），支持 `$ENV` 变量引用 `.env` 中的密钥。关键段：`models`（模型角色 → LLM 实例名映射，实例见 `app/llm/instances/`，每个实例只配置一套）、`langfuse`（追踪开关）、`tracking`（打点独立数据日志，默认 `logs/tracking.data`，不写入 app.log）、`token_pricing`（Token 计费：模型角色 → 输入/输出单价，元 / 1K tokens）、`skills`（技能库目录 + `enabled` 总开关 + E2B 沙箱执行配置，见 docs/SKILL_方案.md）、`plan_evaluation`（旧评估配置，向后兼容）、`evaluators`（推荐的可插拔评估器列表）、`subagents`、`database`（checkpointer：`memory` / `postgres`）、`business_database`（**业务库**：用户/会话/消息/监控配置，`$BUSINESS_DATABASE_URL`，建表 `deploy/sql/business_schema.sql`，见 docs/业务库表结构设计.md）、`auth`（账号密码 + JWT：`jwt_secret` / `access_ttl_minutes` / `refresh_ttl_days`）、`approval`（人工确认：`plan_review` 计划确认中断 / `show_internal_tasks` 是否展示 skill_probe 等内部任务 / `allow_feedback` 允许只提意见，见 docs/中断与恢复方案.md）、`voice`（语音通话：TTS 模型/音色 + 分句切块参数，见 docs/语音通话方案.md）。
 
 
 ## 快速启动（Makefile）

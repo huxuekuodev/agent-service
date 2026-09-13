@@ -23,7 +23,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 from langchain_core.runnables import RunnableConfig
 from langfuse import Langfuse
 from langgraph.runtime import Runtime
-from langgraph.types import Overwrite
+from langgraph.types import Command, Overwrite
 from pydantic import BaseModel, Field
 
 from app.agents.current_time import has_current_time_for_today
@@ -170,6 +170,13 @@ class PlanRun:
     """ask_clarification 的调用参数（问题/类型/选项），用于前端澄清卡片。"""
 
 
+def _is_voice_mode() -> bool:
+    """本次请求是否来自语音通话（决定输出风格）。"""
+    from app.core.context import voice_mode_ctx_var
+
+    return bool(voice_mode_ctx_var.get())
+
+
 async def _build_capability_desc() -> str:
     """执行能力描述 + 技能索引（供规划节点感知可用工具与技能）。"""
     capability = await describe_execute_tools()
@@ -177,6 +184,30 @@ async def _build_capability_desc() -> str:
     if not skills_index:
         return capability
     return f"{capability}\n\n{skills_index}" if capability else skills_index
+
+
+def _summarize_task_results(plan_tasks: list[SubTask], *, max_items: int = 5) -> str:
+    """把已完成任务的结果汇总成答复（模型空输出时的兜底，排除系统内部任务）。"""
+    from app.agents.nodes.step_dispatch_node import INTERNAL_TASK_IDS
+
+    useful = [t for t in plan_tasks if t.plan_id not in INTERNAL_TASK_IDS and t.result and t.result.strip() and t.step_statuses == "completed"]
+    if not useful:
+        return ""
+    if len(useful) == 1:
+        return useful[0].result.strip()
+    lines = [f"- {t.name or t.plan_id}：{t.result.strip()}" for t in useful[:max_items]]
+    extra = f"（另有 {len(useful) - max_items} 项未列出）" if len(useful) > max_items else ""
+    return "已完成的内容如下：\n" + "\n".join(lines) + extra
+
+
+def _dump_plan_output(plan_output: PlanOutput | None) -> str:
+    """把结构化输出压缩成一行日志（排障用）。"""
+    if plan_output is None:
+        return "None"
+    try:
+        return plan_output.model_dump_json()[:500]
+    except Exception:  # pragma: no cover - 理论上不会失败
+        return str(plan_output)[:500]
 
 
 def _render_plan_status(existing_tasks: list[SubTask]) -> str:
@@ -191,6 +222,9 @@ async def _build_messages(state: ThreadState, context: GraphContext, plan_contex
     context_lines: list[str] = []
     if plan_context:
         context_lines.append(f"<PlanStatus>\n当前计划{plan_context}\n\n</PlanStatus>")
+    if _is_voice_mode():
+        # 语音通话：答复会被朗读，长答复=长等待，因此要求口语化短句
+        context_lines.append("<VoiceMode>本次是语音通话，用户在用耳朵听：请用口语化中文回答，控制在 1-2 句、80 字以内；不要 Markdown、列表、表格、代码块与链接；需要多步操作时先说一句「我先去处理」，细节留到最终答复里简短带过。</VoiceMode>")
     if context_lines:
         messages.append(HumanMessage(content="\n".join(context_lines)))
     if not has_current_time_for_today(user_msgs):
@@ -335,9 +369,19 @@ async def _apply_plan_result(
         out.answer(content=plan_output.answer)
         return {"messages": [AIMessage(content=plan_output.answer)], "completed": True, "plan_tasks": Overwrite(value=[])}
 
-    # 5) 直接回复（澄清、审查结论等）
-    out.think("📋 规划完成")
-    return {"messages": run.new_messages, "completed": True}
+    # 5) 兜底：模型既没给答案、也没有新任务（例如审查轮返回空输出）
+    #    直接结束会让用户"什么也看不到"（语音通话里就是"没有可播报的内容"），因此：
+    #    - 有已完成任务的结果 → 汇总成答复（保证用户拿到东西，也保证语音有内容可播）；
+    #    - 完全没有 → 记 warning 便于排查，并给一句诚实的提示而不是静默。
+    summary = _summarize_task_results(existing_tasks)
+    if summary:
+        out.answer(content=summary)
+        logger.warning("[plan] 模型未给出答复，已用已完成任务结果兜底（{} 字）", len(summary))
+        return {"messages": [AIMessage(content=summary)], "completed": True, "plan_tasks": Overwrite(value=[])}
+    logger.warning("[plan] 空输出且无可用结果（plan_output={}）", _dump_plan_output(plan_output))
+    fallback = "这次没有产生可用的结果，请把问题再说清楚一些，或补充关键信息。"
+    out.answer(content=fallback)
+    return {"messages": [AIMessage(content=fallback)], "completed": True, "plan_tasks": Overwrite(value=[])}
 
 
 async def plan_model_node(state: ThreadState, config: RunnableConfig, runtime: Runtime[GraphContext]) -> dict:
@@ -372,8 +416,8 @@ async def plan_model_node(state: ThreadState, config: RunnableConfig, runtime: R
         if retriable:
             raise
         message = build_error_fallback_message(e)
-        out.error(str(message.content))
-        return {"messages": [message], "completed": True}
+        # 错误提示：直接结束节点，不触发重试
+        return Command(update={"messages": [message], "completed": True}, goto="END")
 
 
 def _extract_plan_output(agent_output: dict) -> PlanOutput | None:

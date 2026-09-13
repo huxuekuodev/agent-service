@@ -28,6 +28,9 @@ INTERNAL_ERROR = 1002  # 服务内部错误
 
 # 会话相关（1100 - 1199）
 SESSION_NOT_FOUND = 1100  # 会话不存在
+INTERRUPT_PENDING = 1103  # 会话有挂起的中断，需先经 /resume 答复
+NO_PENDING_INTERRUPT = 1104  # 会话没有挂起的中断（无需/无法恢复）
+INTERRUPT_MISMATCH = 1105  # 答复对应的中断 id 与当前挂起不一致（卡片已过期）
 SESSION_EXISTS = 1101  # 会话已存在（创建时冲突）
 SERVICE_NOT_READY = 1102  # AgentService 未初始化
 
