@@ -19,6 +19,62 @@
 
 BEGIN;
 
+-- ---------------------------------------------------------------- 评估记录（在线评估的"身份证"）
+-- 目的：让每条评估结果都能回答「哪次对话 / 哪个任务 / 哪个技能 / 哪个 prompt 版本 / 哪个模型」，
+-- 从而支持按版本与维度切片对比、定位 bad case、验证改动是否真的有效。
+CREATE TABLE IF NOT EXISTS evaluations (
+    id                  BIGSERIAL PRIMARY KEY,
+    trace_id            TEXT        NOT NULL DEFAULT '',
+    session_id          UUID,
+    -- 逻辑关联 sessions(id)：会话可被逻辑删除，故不设外键
+    message_id          BIGINT,
+    node                TEXT        NOT NULL DEFAULT '',
+    evaluator           TEXT        NOT NULL DEFAULT '',
+    metric              TEXT        NOT NULL,
+    score               NUMERIC(6, 3),
+    passed              BOOLEAN,
+    rationale           TEXT        NOT NULL DEFAULT '',
+    plan_id             TEXT        NOT NULL DEFAULT '',
+    task_id             TEXT        NOT NULL DEFAULT '',
+    skill_id            TEXT        NOT NULL DEFAULT '',
+    run_model           TEXT        NOT NULL DEFAULT '',
+    run_prompt_version  TEXT        NOT NULL DEFAULT '',
+    judge_model         TEXT        NOT NULL DEFAULT '',
+    judge_prompt_version TEXT       NOT NULL DEFAULT '',
+    git_sha             TEXT        NOT NULL DEFAULT '',
+    channel             TEXT        NOT NULL DEFAULT 'chat',
+    meta                JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+COMMENT ON TABLE evaluations IS '评估结果明细（带版本与对象身份，支持按维度切片与前后对比）';
+CREATE INDEX IF NOT EXISTS idx_evaluations_created ON evaluations (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_evaluations_session ON evaluations (session_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_evaluations_metric ON evaluations (evaluator, metric, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_evaluations_version ON evaluations (run_prompt_version, metric);
+CREATE INDEX IF NOT EXISTS idx_evaluations_skill ON evaluations (skill_id, metric) WHERE skill_id <> '';
+
+-- ---------------------------------------------------------------- 改进原料：低分样本 / 用户反馈
+CREATE TABLE IF NOT EXISTS eval_samples (
+    id            BIGSERIAL PRIMARY KEY,
+    evaluation_id BIGINT,
+    session_id    UUID,
+    message_id    BIGINT,
+    trace_id      TEXT   NOT NULL DEFAULT '',
+    kind          TEXT   NOT NULL DEFAULT 'bad_case',
+    label         TEXT   NOT NULL DEFAULT '',
+    metric        TEXT   NOT NULL DEFAULT '',
+    evaluator     TEXT   NOT NULL DEFAULT '',
+    score         NUMERIC(6, 3),
+    input         JSONB  NOT NULL DEFAULT '{}'::jsonb,
+    output        JSONB  NOT NULL DEFAULT '{}'::jsonb,
+    context       JSONB  NOT NULL DEFAULT '{}'::jsonb,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT ck_eval_samples_kind CHECK (kind IN ('bad_case', 'feedback', 'golden'))
+);
+COMMENT ON TABLE eval_samples IS '改进原料：低分样本完整上下文（可回放、可喂给 prompt 优化）与用户显式反馈';
+CREATE INDEX IF NOT EXISTS idx_eval_samples_kind ON eval_samples (kind, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_eval_samples_metric ON eval_samples (metric, created_at DESC);
+
 -- ---------------------------------------------------------------- 迁移记录
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version    TEXT PRIMARY KEY,
@@ -358,6 +414,11 @@ CREATE TRIGGER trg_monitor_components_updated_at BEFORE UPDATE ON monitor_compon
 INSERT INTO schema_migrations (version, note)
 VALUES ('20260912_001_business_schema',
         'users/user_identities/user_tokens/sessions/messages(partitioned)/message_idempotency/session_events/monitor_*')
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO schema_migrations (version, note)
+VALUES ('20260913_002_evaluations',
+        'evaluations（评估明细：版本/对象/评语）+ eval_samples（低分样本与用户反馈）')
 ON CONFLICT (version) DO NOTHING;
 
 COMMIT;

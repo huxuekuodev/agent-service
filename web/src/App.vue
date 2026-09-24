@@ -20,6 +20,7 @@ import {
   deleteSession,
   chatStream,
   resumeSession,
+  submitFeedback,
 } from './api'
 
 const sessions = ref([])
@@ -573,6 +574,19 @@ async function handleVoiceUtterance(text) {
   callState.value = interrupt.value ? 'awaiting_confirm' : 'listening'
 }
 
+/** 用户对某条助手回答的 👍/👎：最便宜、最真实的质量信号（进评估闭环） */
+async function handleFeedback({ index, rating }) {
+  const msg = messages.value[index]
+  if (!msg || msg.feedback || !currentId.value) return
+  msg.feedback = rating
+  try {
+    await submitFeedback(currentId.value, { rating }, msg.message_id || null)
+  } catch (e) {
+    msg.feedback = ''
+    if (!handleAuthError(e)) error.value = e.message || '反馈提交失败'
+  }
+}
+
 /** 通话面板汇报播放状态：正在回答 / 回到聆听 */
 function onCallState(state) {
   if (interrupt.value) return // 等确认时状态由 interrupt 决定，别被覆盖
@@ -677,6 +691,7 @@ function switchView(v) {
           :progress="progress"
           :streaming="streaming"
           @send="handleSend"
+          @feedback="handleFeedback"
         >
           <template #dock>
             <ConfirmCard

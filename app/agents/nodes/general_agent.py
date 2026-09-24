@@ -10,6 +10,7 @@
 
 import asyncio
 import datetime as dt
+import hashlib
 from typing import Any
 
 from langchain.agents import create_agent
@@ -28,6 +29,7 @@ from app.core.context import trace_id_ctx_var
 from app.core.log import logger
 from app.core.tracking import TrackingPage, TrackingType
 from app.core.tracking.tracker import track
+from app.evaluation import update_meta
 from app.llm import create_llm_with_name
 
 #: 技能上下文探测任务 plan_id（与 plan_model_node 保持一致）
@@ -74,13 +76,21 @@ async def general_agent(state: ThreadState, config: RunnableConfig, runtime: Run
     # === 2. 调用 LLM 执行任务 ===
     langfuse_client = runtime.context.langfuse_client
     tools_desc = await describe_execute_tools_v2()
-    if langfuse_client is not None:
-        try:
-            system_prompt = langfuse_client.get_prompt("general_agent_system_prompt").compile(tools_desc=tools_desc)
-        except Exception:
-            system_prompt = await _load_local_general_prompt(tools_desc)
-    else:
-        system_prompt = await _load_local_general_prompt(tools_desc)
+    system_prompt, prompt_version = await _load_general_system_prompt(langfuse_client, tools_desc)
+
+    # 身份与信号：评估结果要能归因到"哪个任务/技能/模型/prompt 版本"
+    current_task = _find_task(plan_id, plan_tasks)
+    skill_id = current_task.skill_id if current_task else ""
+    update_meta(
+        node="general_agent",
+        plan_id=plan_id,
+        task_id=plan_id,
+        skill_id=skill_id,
+        run_model="general_node_model",
+        run_prompt_version=prompt_version,
+        signals={"skill_used": bool(skill_id), "task_count": 1},
+    )
+
     task_info = f"""任务名称：{task_name}\n
                         任务描述：{task_desc}\n
                         计划 ID：{plan_id}\n
@@ -221,6 +231,24 @@ async def _run_skill_probe(plan_tasks: list[SubTask]) -> str:
     except Exception as exc:  # 校验失败不阻塞主流程，下游会看到失败说明
         logger.warning("技能前置校验异常 (skill_id=%s): %s", skill_id, exc)
         return f"技能「{skill_id}」前置校验异常: {exc}"
+
+
+async def _load_general_system_prompt(langfuse_client: Any, tools_desc: str) -> tuple[str, str]:
+    """加载执行节点系统提示词，并返回**版本标识**（用于评估归因与前后对比）。
+
+    - Langfuse 可用：用其 prompt 版本号（``langfuse:v3``）；
+    - 回退本地文件：用内容哈希（``local:ab12cd34``）——改了提示词版本就会变，分数可以对比。
+    """
+    if langfuse_client is not None:
+        try:
+            prompt = await asyncio.to_thread(langfuse_client.get_prompt, "general_agent_system_prompt")
+            text = prompt.compile(tools_desc=tools_desc)
+            version = int(getattr(prompt, "version", 0) or 0)
+            return text, f"langfuse:v{version}" if version else "langfuse:unknown"
+        except Exception:
+            pass
+    text = await _load_local_general_prompt(tools_desc)
+    return text, f"local:{hashlib.sha1(text.encode('utf-8')).hexdigest()[:8]}"
 
 
 async def _skill_task_guide(plan_id: str, plan_tasks: list[SubTask]) -> str:

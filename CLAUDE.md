@@ -42,10 +42,13 @@ agent-service/
 │   ├── 会话持久化方案.md      # 会话列表/历史回放方案（已定：独立业务库 + 逻辑删除 + 真实用户）
 │   ├── 中断与恢复方案.md      # 人工确认（interrupt）与 /resume 恢复协议、合并语义
 │   ├── 语音通话方案.md        # 页内语音通话（浏览器识别 + 服务端按句流式 TTS）设计
+│   ├── 评估闭环方案.md        # 评估 → 归因 → 行动 → 验证（带版本身份、值得评才评、离线跑批）
 │   └── 业务库表结构设计.md    # 业务库表结构说明（users/sessions/messages/session_events）
 ├── deploy/sql/business_schema.sql  # 业务库建表 DDL（幂等，可直接执行）
 ├── skills/                   # 技能仓库：每子目录一个 skill（SKILL.md + reference/ + data/ + scripts/ + errors/cleanup.yaml）
-├── scripts/                  # 运维脚本：sync_langfuse_prompts.py（本地提示词 → Langfuse 推送）
+├── scripts/                  # 运维脚本：sync_langfuse_prompts.py（提示词推送）/ run_eval.py（离线评测跑批）
+├── evalsets/                 # 离线评测集（YAML：问题 + 标签 + 期望要点）
+├── reports/                  # 跑批报告（eval-*.json，含基线对比）
 ├── tests/                    # 测试（当前基本为空）
 └── app/                      # 主代码
     ├── main.py               # FastAPI 入口；lifespan 管理 AgentService 生命周期
@@ -58,6 +61,11 @@ agent-service/
     │   ├── tokens.py         # JWT 签发/校验（HS256 白名单，access/refresh + jti）
     │   ├── service.py        # AuthService：注册/登录/刷新（旋转）/登出/改密
     │   └── deps.py           # FastAPI 依赖 current_user / optional_user
+    ├── evaluation/           # 评估闭环（见 docs/评估闭环方案.md）
+    │   ├── context.py        # RunMeta：一次运行的身份（会话/消息/任务/技能/模型/prompt 版本/git sha）
+    │   ├── policy.py         # "值得评才评"策略（replan/失败/澄清/首轮/追问/多任务/技能）
+    │   ├── store.py          # evaluations / eval_samples 读写与聚合（按维度切片、低分案例）
+    │   └── recorder.py       # 统一记录出口：落库 + 打点 + 低分归档 + 后台异步 + 进程内 sink
     ├── voice/                # 语音通话：播报文本分句 + 服务端 TTS（见 docs/语音通话方案.md）
     │   ├── audio.py          # 清洗 Markdown + 分句切块（首块短、短句合并、超长硬切）
     │   └── service.py        # TTS（OpenAI 兼容 /audio/speech，按句流式；含失效连接重试）
@@ -132,7 +140,7 @@ agent-service/
 
 ## 配置入口
 
-`config.yaml` 是唯一配置源（路径优先级：显式 `config_path` > `AGENT_CONFIG_PATH` > `./config.yaml`），支持 `$ENV` 变量引用 `.env` 中的密钥。关键段：`models`（模型角色 → LLM 实例名映射，实例见 `app/llm/instances/`，每个实例只配置一套）、`langfuse`（追踪开关）、`tracking`（打点独立数据日志，默认 `logs/tracking.data`，不写入 app.log）、`token_pricing`（Token 计费：模型角色 → 输入/输出单价，元 / 1K tokens）、`skills`（技能库目录 + `enabled` 总开关 + E2B 沙箱执行配置，见 docs/SKILL_方案.md）、`plan_evaluation`（旧评估配置，向后兼容）、`evaluators`（推荐的可插拔评估器列表）、`subagents`、`database`（checkpointer：`memory` / `postgres`）、`business_database`（**业务库**：用户/会话/消息/监控配置，`$BUSINESS_DATABASE_URL`，建表 `deploy/sql/business_schema.sql`，见 docs/业务库表结构设计.md）、`auth`（账号密码 + JWT：`jwt_secret` / `access_ttl_minutes` / `refresh_ttl_days`）、`approval`（人工确认：`plan_review` 计划确认中断 / `show_internal_tasks` 是否展示 skill_probe 等内部任务 / `allow_feedback` 允许只提意见，见 docs/中断与恢复方案.md）、`voice`（语音通话：TTS 模型/音色 + 分句切块参数，见 docs/语音通话方案.md）。
+`config.yaml` 是唯一配置源（路径优先级：显式 `config_path` > `AGENT_CONFIG_PATH` > `./config.yaml`），支持 `$ENV` 变量引用 `.env` 中的密钥。关键段：`models`（模型角色 → LLM 实例名映射，实例见 `app/llm/instances/`，每个实例只配置一套）、`langfuse`（追踪开关）、`tracking`（打点独立数据日志，默认 `logs/tracking.data`，不写入 app.log）、`token_pricing`（Token 计费：模型角色 → 输入/输出单价，元 / 1K tokens）、`skills`（技能库目录 + `enabled` 总开关 + E2B 沙箱执行配置，见 docs/SKILL_方案.md）、`plan_evaluation`（旧评估配置，向后兼容）、`evaluators`（推荐的可插拔评估器列表）、`subagents`、`database`（checkpointer：`memory` / `postgres`）、`business_database`（**业务库**：用户/会话/消息/监控配置，`$BUSINESS_DATABASE_URL`，建表 `deploy/sql/business_schema.sql`，见 docs/业务库表结构设计.md）、`auth`（账号密码 + JWT：`jwt_secret` / `access_ttl_minutes` / `refresh_ttl_days`）、`approval`（人工确认：`plan_review` 计划确认中断 / `show_internal_tasks` 是否展示 skill_probe 等内部任务 / `allow_feedback` 允许只提意见，见 docs/中断与恢复方案.md）、`voice`（语音通话：TTS 模型/音色 + 分句切块参数，见 docs/语音通话方案.md）、`evaluation_policy`（评估策略：`mode=worth_it|always|off` / `baseline_sample_rate` / `async_enabled` / `max_concurrency`，见 docs/评估闭环方案.md）。
 
 
 ## 快速启动（Makefile）

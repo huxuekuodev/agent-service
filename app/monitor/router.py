@@ -43,6 +43,79 @@ def _store_or_500(exc: Exception) -> BizError:
 
 
 # ---------------------------------------------------------------------------
+# 评估闭环（evaluations / eval_samples）
+# ---------------------------------------------------------------------------
+
+#: 允许的切片维度（与 app/evaluation/store.py 白名单一致）
+_EVAL_DIMENSIONS = ["run_prompt_version", "run_model", "skill_id", "node", "channel", "evaluator", "metric", "git_sha"]
+
+
+@router.get("/evaluations/summary")
+async def evaluations_summary(
+    dimension: str = Query("run_prompt_version", description=f"切片维度: {_EVAL_DIMENSIONS}"),
+    metric: str = Query("", description="指标名过滤，空=全部"),
+    evaluator: str = Query("", description="评估器过滤，空=全部"),
+    start: str = Query("", description="开始时间（ISO），空=不限"),
+    end: str = Query("", description="结束时间（ISO），空=不限"),
+) -> dict[str, Any]:
+    """按维度聚合：均值 / 通过率 / 样本数（回答"哪个版本/模型/技能更好"）。"""
+    try:
+        from app.evaluation import store as eval_store
+
+        rows = await eval_store.summary_by_dimension(dimension=dimension, metric=metric, evaluator=evaluator, start=start or None, end=end or None)
+    except ValueError as exc:
+        raise BizError(BAD_REQUEST, str(exc)) from exc
+    except Exception as exc:
+        raise _store_or_500(exc) from exc
+    return ok({"dimension": dimension, "rows": rows, "dimensions": _EVAL_DIMENSIONS})
+
+
+@router.get("/evaluations/trend")
+async def evaluations_trend(
+    metric: str = Query("", description="指标名，空=全部指标汇总"),
+    dimension: str = Query("run_prompt_version", description="按天 × 该维度"),
+    start: str = Query(""),
+    end: str = Query(""),
+) -> dict[str, Any]:
+    """按天趋势（改动上线后指标有没有变好）。"""
+    try:
+        from app.evaluation import store as eval_store
+
+        rows = await eval_store.trend_by_metric(metric=metric, dimension=dimension, start=start or None, end=end or None)
+    except Exception as exc:
+        raise _store_or_500(exc) from exc
+    return ok({"metric": metric, "dimension": dimension, "rows": rows})
+
+
+@router.get("/evaluations/bad-cases")
+async def evaluations_bad_cases(
+    metric: str = Query("", description="指标名过滤"),
+    evaluator: str = Query(""),
+    limit: int = Query(20, ge=1, le=200),
+) -> dict[str, Any]:
+    """低分案例（含完整上下文，可直接拿去改 prompt / 改技能）。"""
+    try:
+        from app.evaluation import store as eval_store
+
+        rows = await eval_store.list_bad_cases(metric=metric, evaluator=evaluator, limit=limit)
+    except Exception as exc:
+        raise _store_or_500(exc) from exc
+    return ok({"cases": rows})
+
+
+@router.get("/evaluations/feedback")
+async def evaluations_feedback(limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
+    """用户显式反馈（👍/👎）：最便宜的在线质量信号。"""
+    try:
+        from app.evaluation import store as eval_store
+
+        rows = await eval_store.list_feedback(limit=limit)
+    except Exception as exc:
+        raise _store_or_500(exc) from exc
+    return ok({"feedback": rows})
+
+
+# ---------------------------------------------------------------------------
 # 基础元信息
 # ---------------------------------------------------------------------------
 

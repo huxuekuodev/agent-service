@@ -309,6 +309,14 @@ async def maybe_evaluate_plan(
         if eval_settings is None or not eval_settings.enabled:
             return
 
+        # 策略门：值得评才评（replan / 失败 / 澄清 / 首轮 / 追问 / 多任务 / 用技能），其余抽样
+        from app.evaluation import current_meta, decide
+
+        decision = decide(signals=current_meta().signals, sample_rate=eval_settings.sample_rate)
+        if not decision.should:
+            logger.debug("[evaluation] 跳过规划评估: %s", decision.reason)
+            return
+
         def _build_judge_llm(model_name: str | None) -> Any | None:
             if not model_name:
                 return None
@@ -326,27 +334,29 @@ async def maybe_evaluate_plan(
         if evaluator is None:
             return
 
+        prompt_input = evaluator.build_prompt_input(eval_input)
         result = await evaluator.evaluate(
             trace_id=trace_id,
-            prompt_input=evaluator.build_prompt_input(eval_input),
+            prompt_input=prompt_input,
             messages=messages,
             config=config,
         )
-        # 评估结果打点（page=evaluation，p0=评估器, p1=指标, p2=得分, p3=passed）
+        # 统一记录：落库（带版本/对象身份）+ 打点 + 低分归档（默认后台异步，不拖慢对话）
         if result is not None and result.scores:
-            from app.core.tracking import TrackingPage, TrackingType
-            from app.core.tracking.tracker import track
+            from app.evaluation import record_evaluation, update_meta
 
-            role = eval_settings.model or ""
-            for metric, score in result.scores.items():
-                await track(
-                    TrackingType.EVALUATION,
-                    TrackingPage.EVALUATION,
-                    model=role,
-                    p0="PlanEvaluator",
-                    p1=metric,
-                    p2=str(score),
-                    p3=str(result.passed).lower(),
-                )
+            update_meta(judge_model=eval_settings.model or "")
+            await record_evaluation(
+                evaluator="PlanEvaluator",
+                node="plan_node",
+                metric_scores=result.scores,
+                rationales=result.rationales,
+                passed=result.passed,
+                judge_model=eval_settings.model or "",
+                trace_id=trace_id,
+                prompt_input=prompt_input,
+                output_payload={"plan_action": eval_input.plan_action, "tasks": eval_input.tasks, "clarification_requested": eval_input.clarification_requested},
+                extra_meta={"policy_reason": decision.reason, "policy_signals": decision.signals},
+            )
     except Exception as exc:
         logger.warning("Plan evaluation skipped: %s", exc)

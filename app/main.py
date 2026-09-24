@@ -98,6 +98,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         except Exception as exc:
             logger.warning("技能沙箱会话回收异常: {}", exc)
         try:
+            from app.evaluation import aclose_recorder
+
+            pending = await aclose_recorder()
+            if pending:
+                logger.warning("仍有 {} 个后台评估任务未完成（已取消）", pending)
+        except Exception as exc:
+            logger.warning("评估记录器收尾异常: {}", exc)
+        try:
             from app.voice.service import get_voice_service
 
             await get_voice_service().aclose()

@@ -198,6 +198,43 @@ async def delete_session(
     return ok({"session_id": row["session_id"], "thread_id": row["thread_id"], "checkpoint_cleared": thread_cleared})
 
 
+class FeedbackRequest(BaseModel):
+    """用户对某条助手消息的显式反馈。"""
+
+    rating: str = Field(..., description="up=有帮助 / down=没帮助")
+    comment: str = Field(default="", max_length=500, description="可选原因（最有价值的部分）")
+    metric: str = Field(default="user_satisfaction", description="落库时用的指标名")
+
+
+@router.post("/{session_id}/feedback")
+async def submit_feedback(
+    session_id: str,
+    req: FeedbackRequest,
+    message_id: int | None = None,
+    user: dict[str, Any] = Depends(current_user),
+    sessions: SessionService = Depends(get_session_service),
+) -> dict[str, Any]:
+    """提交用户反馈（👍/👎）——最便宜、最真实的在线质量信号，与 LLM judge 互补。"""
+    _require_store()
+    if req.rating not in ("up", "down"):
+        raise BizError(1100, "rating 只支持 up / down")
+    session = await sessions.require(session_id, user_id=str(user["user_id"]))
+    from app.evaluation import store as eval_store
+
+    sample_id = await eval_store.insert_sample(
+        kind="feedback",
+        label=req.rating,
+        metric=req.metric,
+        evaluator="UserFeedback",
+        score=5.0 if req.rating == "up" else 1.0,
+        session_id=session["session_id"],
+        message_id=message_id,
+        input_payload={"session_id": session["session_id"], "message_id": message_id},
+        context={"rating": req.rating, "comment": req.comment, "user_id": user["user_id"]},
+    )
+    return ok({"sample_id": sample_id, "rating": req.rating})
+
+
 @router.get("/{session_id}/messages")
 async def get_messages(
     session_id: str,
@@ -228,11 +265,12 @@ async def chat_sync(
     _require_store()
     session = await sessions.require(session_id, user_id=str(user["user_id"]))
     await _prepare_turn(svc, session)
-    await sessions.record_user_message(session, content=req.message, client_msg_id=req.client_msg_id)
+    await _record_user_message(sessions, session, content=req.message, client_msg_id=req.client_msg_id)
 
     collector = AssistantReplyCollector()
     usage = UsageCollector()
     started = time.perf_counter()
+    identity = _bind_run_identity(user_id=str(user["user_id"]), session=session, channel="voice" if req.voice else "chat")
     try:
         async for event in svc.stream(session["thread_id"], req.message, usage=usage, voice=req.voice):
             collector.feed(event)
@@ -241,6 +279,10 @@ async def chat_sync(
         await sessions.record_assistant_message(session_id, content=str(exc), kind="error", payload={"error": str(exc)})
         raise BizError(INTERNAL_ERROR, str(exc)) from exc
 
+    finally:
+        from app.evaluation import reset_meta
+
+        reset_meta(identity)
     latency_ms = int((time.perf_counter() - started) * 1000)
     await _persist_reply(sessions, session_id, collector, latency_ms, usage=usage, user_id=str(user["user_id"]))
     return ok(
@@ -270,7 +312,7 @@ async def chat_stream(
     _require_store()
     session = await sessions.require(session_id, user_id=str(user["user_id"]))
     await _prepare_turn(svc, session)
-    await sessions.record_user_message(session, content=req.message, client_msg_id=req.client_msg_id)
+    await _record_user_message(sessions, session, content=req.message, client_msg_id=req.client_msg_id)
     thread_id = session["thread_id"]
 
     async def event_gen():
@@ -279,6 +321,9 @@ async def chat_stream(
         started = time.perf_counter()
         failed = False
         interrupt_payload: dict[str, Any] = {}
+        from app.evaluation import reset_meta
+
+        identity = _bind_run_identity(user_id=str(user["user_id"]), session=session, channel="voice" if req.voice else "chat")
         try:
             async for chunk in svc.stream(thread_id, req.message, usage=usage, voice=req.voice):
                 if not isinstance(chunk, dict):
@@ -308,6 +353,7 @@ async def chat_stream(
                 usage=usage,
                 user_id=str(user["user_id"]),
             )
+            reset_meta(identity)
             if req.voice:
                 # 语音模式：把答复（或计划确认提示）按句合成，逐块回传供前端排队播放
                 speech_text = plan_review_speech(interrupt_payload) if interrupt_payload else collector.content
@@ -348,7 +394,8 @@ async def resume_session(
     feedback = "\n".join(a.custom.strip() for a in req.answers if a.custom.strip())
 
     # 用户答复作为一条 user 消息落库（历史里能看到"我提了什么意见"）
-    await sessions.record_user_message(
+    await _record_user_message(
+        sessions,
         session,
         content=feedback or "（继续执行）",
         client_msg_id=req.client_msg_id,
@@ -361,6 +408,9 @@ async def resume_session(
         started = time.perf_counter()
         failed = False
         interrupt_payload: dict[str, Any] = {}
+        from app.evaluation import reset_meta
+
+        identity = _bind_run_identity(user_id=str(user["user_id"]), session=session, channel="voice" if req.voice else "chat")
         try:
             async for chunk in svc.stream(thread_id, resume=payload, usage=usage, voice=req.voice):
                 if not isinstance(chunk, dict):
@@ -386,6 +436,7 @@ async def resume_session(
                 usage=usage,
                 user_id=str(user["user_id"]),
             )
+            reset_meta(identity)
             if req.voice:
                 # 语音模式：把答复（或计划确认提示）按句合成，逐块回传供前端排队播放
                 speech_text = plan_review_speech(interrupt_payload) if interrupt_payload else collector.content
@@ -426,6 +477,33 @@ async def _voice_frames(text: str):
     if not emitted:
         yield f"data: {_serialize(ok(data={'type': 'voice_unavailable', 'msg': '本轮没有可播报的内容'}))}\n\n"
     yield f"data: {_serialize(ok(data={'type': 'voice_end'}))}\n\n"
+
+
+def _bind_run_identity(*, user_id: str, session: dict[str, Any], channel: str, message_id: int | None = None) -> Any:
+    """把本轮运行的"身份"写进评估上下文（见 app/evaluation/context.py）。
+
+    评估要能回答"这条分属于哪次对话/哪条消息/什么渠道"，否则只能看平均分。
+    返回 token，调用方在 finally 里 reset。
+    """
+    from app.evaluation import update_meta
+
+    return update_meta(
+        user_id=user_id,
+        session_id=session.get("session_id", ""),
+        thread_id=session.get("thread_id", ""),
+        channel=channel,
+        message_id=message_id,
+    )
+
+
+async def _record_user_message(sessions: SessionService, session: dict[str, Any], *, content: str, client_msg_id: str | None = None) -> Any:
+    """记录用户消息，并把落库后的 message_id 回填进评估身份。"""
+    row = await sessions.record_user_message(session, content=content, client_msg_id=client_msg_id)
+    if row and row.get("message_id"):
+        from app.evaluation import update_meta
+
+        update_meta(message_id=int(row["message_id"]))
+    return row
 
 
 async def _prepare_turn(svc: AgentService, session: dict[str, Any]) -> None:

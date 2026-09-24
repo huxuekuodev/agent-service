@@ -1,0 +1,76 @@
+# 核心能力评测集（离线跑批用）
+#
+# 用途：改 prompt / 换模型 / 改技能后，先在**固定样本**上跑出"比基线好还是差"再上线。
+# 运行：uv run python scripts/run_eval.py --label candidate-2026-09-13 --limit 8
+#
+# 字段：
+#   id          用例唯一名（报告里按它对比）
+#   question    用户问题（真实场景复述）
+#   tags        维度标签（用于分组看指标：plan/execute/skill/clarify/multi_turn）
+#   expect      期望要点（rubric 用；不必逐字匹配，评估器会判断产出是否覆盖）
+#               - must_cover: 必须覆盖的要点关键词
+#               - should_clarify: 是否应当先澄清
+#               - min_tasks / max_tasks: 期望的任务数范围（拆解粒度）
+#   follow_ups  可选：后续消息（多轮场景），按顺序发送
+
+cases:
+  - id: simple_fact
+    question: 你好，你能做什么？
+    tags: [plan, direct_answer]
+    expect:
+      should_clarify: false
+      max_tasks: 0
+      must_cover: ["任务", "规划"]
+
+  - id: single_task_weather
+    question: 查一下北京今天的天气
+    tags: [plan, skill]
+    expect:
+      should_clarify: false
+      min_tasks: 1
+      max_tasks: 2
+
+  - id: clarify_missing_city
+    question: 明天天气怎么样？
+    tags: [clarify, skill]
+    expect:
+      should_clarify: true
+
+  - id: two_city_compare
+    question: 北京和上海今天哪个更适合跑步？
+    tags: [plan, execute, multi_task]
+    expect:
+      should_clarify: false
+      min_tasks: 1
+      max_tasks: 4
+      must_cover: ["北京", "上海"]
+
+  - id: doc_summary_skill
+    question: 帮我看看语雀上「产品需求」这份文档最近一版改了什么
+    tags: [plan, skill, yuque]
+    expect:
+      should_clarify: false
+      min_tasks: 1
+      max_tasks: 3
+
+  - id: multi_turn_refine
+    question: 给我一个三天北京出行计划
+    tags: [plan, multi_turn]
+    expect:
+      should_clarify: false
+      min_tasks: 1
+      max_tasks: 5
+    follow_ups:
+      - 把第二天换成室内活动
+
+  - id: ambiguous_scope
+    question: 帮我整理一下数据
+    tags: [clarify]
+    expect:
+      should_clarify: true
+
+  - id: tool_unavailable
+    question: 帮我查一下公司内网 wiki 上的值班表
+    tags: [plan, tool_selection]
+    expect:
+      should_clarify: true

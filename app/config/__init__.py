@@ -377,6 +377,40 @@ class DatabaseConfig:
 
 
 @dataclass
+class EvaluationPolicyConfig:
+    """评估策略配置（config.yaml ``evaluation_policy``）。
+
+    解决两个现实问题：**该评的没评（信息量不足）** 与 **不该评的乱评（成本高）**。
+    默认 ``worth_it``：只在出过问题或信息量大的轮次评估，其余按 ``baseline_sample_rate`` 抽样。
+    """
+
+    mode: str = "worth_it"
+    """worth_it（值得评才评）/ always（全量）/ off（不评）。"""
+    baseline_sample_rate: float = 0.05
+    """worth_it 模式下，对"普通轮次"的抽样率（0 = 完全不评）。"""
+    async_enabled: bool = True
+    """评估放后台执行（不拖慢对话）；false 时同步等待，便于调试与跑批。"""
+    max_concurrency: int = 2
+    """后台评估并发上限（judge 调用 + 落库）。"""
+    archive_bad_cases: bool = True
+    """是否把低分样本连同完整上下文归档到 eval_samples（改进原料）。"""
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> EvaluationPolicyConfig:
+        d = d or {}
+        mode = str(d.get("mode", "worth_it") or "worth_it").lower()
+        if mode not in ("worth_it", "always", "off"):
+            raise ValueError(f"evaluation_policy.mode 只支持 worth_it / always / off，当前: {mode}")
+        return cls(
+            mode=mode,
+            baseline_sample_rate=min(1.0, max(0.0, float(d.get("baseline_sample_rate", 0.05) or 0.0))),
+            async_enabled=bool(d.get("async_enabled", True)),
+            max_concurrency=max(1, int(d.get("max_concurrency", 2) or 2)),
+            archive_bad_cases=bool(d.get("archive_bad_cases", True)),
+        )
+
+
+@dataclass
 class VoiceConfig:
     """语音通话配置（config.yaml ``voice``）。
 
@@ -702,6 +736,9 @@ class AppConfig:
     # 语音通话（ASR + TTS）
     voice: VoiceConfig = field(default_factory=VoiceConfig)
 
+    # 评估策略（值得评才评 + 异步 + 低分归档）
+    evaluation_policy: EvaluationPolicyConfig = field(default_factory=EvaluationPolicyConfig)
+
     @classmethod
     def from_file(cls, path: str | None = None) -> AppConfig:
         """从 YAML 文件加载配置。"""
@@ -739,6 +776,7 @@ class AppConfig:
             auth=AuthConfig.from_dict(data.get("auth")),
             approval=ApprovalConfig.from_dict(data.get("approval")),
             voice=VoiceConfig.from_dict(data.get("voice")),
+            evaluation_policy=EvaluationPolicyConfig.from_dict(data.get("evaluation_policy")),
             yuque=YuqueConfig.from_dict(data.get("yuque")),
             ingest=KnowledgeIngestConfig.from_dict(data.get("ingest")),
             elasticsearch=ElasticsearchConfig.from_dict(data.get("elasticsearch")),

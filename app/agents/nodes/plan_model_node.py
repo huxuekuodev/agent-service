@@ -19,23 +19,27 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from langchain.agents import create_agent
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import (AIMessage, BaseMessage, HumanMessage,
+                                     ToolMessage)
 from langchain_core.runnables import RunnableConfig
 from langfuse import Langfuse
 from langgraph.runtime import Runtime
 from langgraph.types import Command, Overwrite
 from pydantic import BaseModel, Field
 
-from app.agents.current_time import has_current_time_for_today
 from app.agents.errors import build_error_fallback_message, classify_llm_error
-from app.agents.evaluation.plan_evaluator import EvaluationInput, maybe_evaluate_plan
+from app.agents.evaluation.plan_evaluator import (EvaluationInput,
+                                                  maybe_evaluate_plan)
 from app.agents.events import Output, ToolCallAccumulator
 from app.agents.lead_agent import GraphContext
-from app.agents.middlewares.clarification_middleware import ClarificationMiddleware
-from app.agents.middlewares.dangling_tool_call_middleware import DanglingToolCallMiddleware
+from app.agents.middlewares.clarification_middleware import \
+    ClarificationMiddleware
+from app.agents.middlewares.dangling_tool_call_middleware import \
+    DanglingToolCallMiddleware
 from app.agents.subtask import SubTask
 from app.agents.thread_state import ThreadState
 from app.agents.tools import describe_execute_tools, get_plan_tools
+from app.agents.utils.current_time import has_current_time_for_today
 from app.core.context import trace_id_ctx_var
 from app.core.log import logger
 from app.core.tracking import TrackingPage, TrackingType
@@ -65,14 +69,25 @@ class PlanOutput(BaseModel):
 
 
 async def _build_system_prompt(agent_descriptions: str = "", capability_descriptions: str = "") -> str:
+    """取规划节点系统提示词，并顺手记录**所用的 prompt 版本**（评估归因的关键维度）。
+
+    Langfuse 的 prompt 带版本号：写进 RunMeta 后，"这版 prompt 分数有没有变好"才能对比出来。
+    """
     # Langfuse API 调用（网络 IO），异步
     langfuse = Langfuse()
-    return await asyncio.to_thread(
-        lambda: langfuse.get_prompt("plan_node_system_prompt", type="text").compile(
+
+    def _fetch():
+        prompt = langfuse.get_prompt("plan_node_system_prompt", type="text")
+        return prompt.compile(
             agent_descriptions=agent_descriptions or "- general_agent: 通用执行 agent，可调用所有工具",
             capability_descriptions=capability_descriptions or "",
-        )
-    )
+        ), int(getattr(prompt, "version", 0) or 0)
+
+    text, version = await asyncio.to_thread(_fetch)
+    from app.evaluation import update_meta
+
+    update_meta(run_prompt_version=f"langfuse:v{version}" if version else "langfuse:unknown")
+    return text
 
 
 def _to_subtask(t: PlanTask) -> SubTask:
@@ -389,7 +404,7 @@ async def plan_model_node(state: ThreadState, config: RunnableConfig, runtime: R
     context = runtime.context
     trace_id = trace_id_ctx_var.get()
     out = Output("plan_node", trace_id=trace_id)
-    out.think("📋 分析需求，制定执行计划...")
+    out.think("📋 分析问题中ing")
 
     existing_tasks = state.get("plan_tasks", [])
     plan_context = _render_plan_status(existing_tasks)
@@ -406,6 +421,26 @@ async def plan_model_node(state: ThreadState, config: RunnableConfig, runtime: R
         if run.plan_output:
             eval_input.plan_action = run.plan_output.action
             eval_input.tasks = [t.model_dump() for t in run.plan_output.tasks]
+        # 身份与信号：评估结果要能归因（哪个任务/技能/prompt 版本），策略要能判断"值不值得评"
+        from app.evaluation import update_meta
+        from app.llm.builders import \
+            _resolve_model_name  # noqa: PLC0415  (运行时解析角色名)
+
+        skill_ids = [t.skill_id for t in (run.plan_output.tasks if run.plan_output else []) if getattr(t, "skill_id", "")]
+        update_meta(
+            node="plan_node",
+            run_model=_resolve_model_name(None, app_config=context.app_config),
+            plan_id=(run.plan_output.tasks[0].plan_id if run.plan_output and run.plan_output.tasks else ""),
+            skill_id=(skill_ids[0] if skill_ids else ""),
+            signals={
+                "replan": bool(existing_tasks),
+                "clarify": bool(run.has_clarification),
+                "task_count": len(run.plan_output.tasks) if run.plan_output else 0,
+                "skill_used": bool(skill_ids),
+                "first_turn": not bool(state.get("plan_tasks")),
+                "failed_task": any(getattr(t, "step_statuses", "") == "failed" for t in existing_tasks),
+            },
+        )
         await maybe_evaluate_plan(trace_id=trace_id, eval_input=eval_input, messages=messages, config=config, runtime=runtime)
 
         return await _apply_plan_result(run=run, existing_tasks=existing_tasks, out=out, config=config, trace_id=trace_id)

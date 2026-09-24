@@ -239,9 +239,59 @@ function meaningOf(page, slot) {
   return m?.label || ''
 }
 
+// ---------------------------------------------------------------------------
+// 评估闭环：按维度切片 + 低分案例 + 用户反馈
+// ---------------------------------------------------------------------------
+const evalDimension = ref('run_prompt_version')
+const evalMetric = ref('')
+const evalRows = ref([])
+const evalCases = ref([])
+const evalFeedback = ref([])
+const evalError = ref('')
+
+const EVAL_DIMENSIONS = [
+  { value: 'run_prompt_version', label: 'Prompt 版本' },
+  { value: 'run_model', label: '被评模型' },
+  { value: 'skill_id', label: '技能' },
+  { value: 'node', label: '节点' },
+  { value: 'channel', label: '渠道（chat/voice）' },
+  { value: 'git_sha', label: '代码版本' },
+  { value: 'evaluator', label: '评估器' },
+]
+
+async function loadEvalSummary() {
+  evalError.value = ''
+  try {
+    const data = await monitorEvalSummary({ dimension: evalDimension.value, metric: evalMetric.value })
+    evalRows.value = data?.rows ?? []
+  } catch (e) {
+    evalError.value = e?.message || '加载评估汇总失败'
+    evalRows.value = []
+  }
+}
+
+async function loadEvalCases() {
+  try {
+    evalCases.value = await monitorEvalBadCases({ metric: evalMetric.value, limit: 10 })
+  } catch (e) {
+    console.warn('加载低分案例失败:', e)
+  }
+}
+
+async function loadEvalFeedback() {
+  try {
+    evalFeedback.value = await monitorEvalFeedback(10)
+  } catch (e) {
+    console.warn('加载用户反馈失败:', e)
+  }
+}
+
 function refreshAll() {
   loadComponents()
   loadTokenUsage()
+  loadEvalSummary()
+  loadEvalCases()
+  loadEvalFeedback()
 }
 
 defineExpose({ refreshAll })
@@ -250,6 +300,9 @@ defineExpose({ refreshAll })
 loadMeta()
 loadComponents()
 loadTokenUsage()
+loadEvalSummary()
+loadEvalCases()
+loadEvalFeedback()
 </script>
 
 <template>
@@ -352,6 +405,65 @@ loadTokenUsage()
       </div>
     </div>
 
+    <!-- 评估闭环 -->
+    <section class="token-card">
+      <h3>🎯 评估闭环（按维度对比 + 低分案例）</h3>
+      <div class="form-row">
+        <label>切片维度
+          <select v-model="evalDimension" class="ctl" @change="loadEvalSummary">
+            <option v-for="d in EVAL_DIMENSIONS" :key="d.value" :value="d.value">{{ d.label }}</option>
+          </select>
+        </label>
+        <label>指标过滤
+          <input v-model="evalMetric" class="ctl" placeholder="如 task_atomicity（空=全部）" @change="loadEvalSummary(); loadEvalCases()" />
+        </label>
+      </div>
+      <p v-if="evalError" class="muted">{{ evalError }}</p>
+      <table v-if="evalRows.length">
+        <thead>
+          <tr><th>维度值</th><th>指标</th><th>样本数</th><th>平均分</th><th>通过率</th></tr>
+        </thead>
+        <tbody>
+          <tr v-for="(r, i) in evalRows" :key="i">
+            <td>{{ r.dimension_value || '(空)' }}</td>
+            <td>{{ r.metric }}</td>
+            <td>{{ r.samples }}</td>
+            <td>{{ r.avg_score }}</td>
+            <td>{{ r.pass_rate }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-else class="muted">暂无评估数据（评估按策略触发：replan / 失败 / 澄清 / 首轮 / 追问 / 多任务 / 用技能）。</p>
+
+      <h4 class="sub">🚩 低分案例（可直接拿去改 prompt / 技能）</h4>
+      <div v-for="c in evalCases" :key="c.id" class="case">
+        <div class="case-head">
+          <span class="tag">{{ c.metric }}</span>
+          <span class="tag">{{ c.evaluator }}</span>
+          <span class="tag">分数 {{ c.score }}</span>
+          <span class="tag">{{ c.created_at }}</span>
+        </div>
+        <div v-if="c.rationale" class="case-line">评语：{{ c.rationale }}</div>
+        <div class="case-line">问题：{{ (c.input && (c.input.user_messages || []).join(' / ')) || '-' }}</div>
+        <div class="case-line">产出：{{ JSON.stringify(c.output).slice(0, 240) }}</div>
+      </div>
+      <p v-if="!evalCases.length" class="muted">暂无低分案例（低于 3 分的指标会自动归档）。</p>
+
+      <h4 class="sub">👍 用户反馈（最真实的信号）</h4>
+      <table v-if="evalFeedback.length">
+        <thead><tr><th>评价</th><th>原因</th><th>会话</th><th>时间</th></tr></thead>
+        <tbody>
+          <tr v-for="f in evalFeedback" :key="f.id">
+            <td>{{ f.label === 'up' ? '👍 有帮助' : '👎 没帮助' }}</td>
+            <td>{{ (f.context && f.context.comment) || '-' }}</td>
+            <td class="mono">{{ String(f.session_id || '').slice(0, 8) }}</td>
+            <td>{{ f.created_at }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-else class="muted">还没有用户反馈（对话气泡上的 👍/👎 会记到这里）。</p>
+    </section>
+
     <!-- Token 消耗汇总 -->
     <section class="token-card">
       <h3>💳 Token 消耗汇总（当前会话）</h3>
@@ -405,6 +517,36 @@ export default { components: { MonitorChart } }
 </script>
 
 <style scoped>
+.sub {
+  margin: 16px 0 8px;
+  font-size: 14px;
+}
+
+.case {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+
+.case-head {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+
+.case-line {
+  color: var(--text-2);
+  line-height: 1.6;
+  word-break: break-word;
+}
+
+.mono {
+  font-family: ui-monospace, monospace;
+}
+
 .monitor {
   flex: 1;
   min-width: 0;

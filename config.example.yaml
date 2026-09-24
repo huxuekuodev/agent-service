@@ -239,3 +239,12 @@ voice:
   first_chunk_max_chars: 30             # 首块上限：越小第一声越快
   max_chunks: 20                        # 最多合成块数
   timeout: 45                           # 单次 TTS 超时（秒）
+
+# 评估策略（见 docs/评估闭环方案.md）
+# worth_it：只在"出过问题/信息量大"的轮次评估（replan、失败任务、澄清、首轮、追问、多任务、用技能）
+evaluation_policy:
+  mode: worth_it             # worth_it | always（全量） | off（不评）
+  baseline_sample_rate: 0.05 # 普通轮次的抽样率
+  async_enabled: true        # 评估放后台，不占对话延迟
+  max_concurrency: 2         # 后台评估并发上限
+  archive_bad_cases: true    # 低分样本连同完整上下文归档（改进原料）

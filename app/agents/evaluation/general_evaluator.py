@@ -84,6 +84,19 @@ def _serialize_tool_messages(messages: list[Any]) -> list[dict]:
     return [_serialize_message(m) for m in messages]
 
 
+def _has_tool_activity(history: list[dict]) -> bool:
+    """历史里是否出现过工具调用/工具结果（判断"路径效率"是否可评）。"""
+    for item in history or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("tool_calls"):
+            return True
+        name = str(item.get("type", ""))
+        if "Tool" in name or name.lower() in ("tool", "function"):
+            return True
+    return False
+
+
 class GeneralEvaluationInput:
     """执行节点评估输入。
 
@@ -150,6 +163,17 @@ class GeneralEvaluator(BaseEvaluator):
             "tools_desc": eval_input.tools_desc,
             "current_time": eval_input.current_time,
         }
+
+    def is_metric_applicable(self, name: str, prompt_input: dict[str, Any] | None = None) -> bool:
+        """指标适用性：**没有工具调用就不评"路径效率"**。
+
+        否则纯回答型任务（一次就答完、不需要工具）会被打低分，把 path_efficiency 的均值污染成
+        "看起来效率很差"，进而误导改进方向（这是跑批时实测发现的问题）。
+        """
+        prompt_input = prompt_input or {}
+        if name == "path_efficiency":
+            return _has_tool_activity(prompt_input.get("history") or [])
+        return True
 
     @staticmethod
     def _format_history(history: list[dict]) -> str:
@@ -323,33 +347,51 @@ async def maybe_evaluate_general(
         if evaluator is None:
             return
 
+        from app.evaluation import current_meta as _current_meta
+        from app.evaluation import decide as _decide
+
+        _decision = _decide(signals=_current_meta().signals, sample_rate=eval_settings.sample_rate)
+        if not _decision.should:
+            logger.debug("[evaluation] 跳过执行评估: %s", _decision.reason)
+            return
+
+        from app.evaluation import current_meta as _current_meta
+        from app.evaluation import decide as _decide
+
+        _decision = _decide(signals=_current_meta().signals, sample_rate=eval_settings.sample_rate)
+        if not _decision.should:
+            logger.debug("[evaluation] 跳过执行评估: %s", _decision.reason)
+            return
+
         eval_input = GeneralEvaluationInput(
             task_info=task_info,
             history=_serialize_tool_messages(messages),
             tools_desc=tools_desc,
             current_time=current_time,
         )
+        _prompt_input = evaluator.build_prompt_input(eval_input)
         result = await evaluator.evaluate(
             trace_id=trace_id,
-            prompt_input=evaluator.build_prompt_input(eval_input),
+            prompt_input=_prompt_input,
             messages=messages,
             config=config,
         )
-        # 评估结果打点（page=evaluation，p0=评估器, p1=指标, p2=得分, p3=passed）
+        # 统一记录：落库（带版本/对象身份）+ 打点 + 低分归档（后台异步）
         if result is not None and result.scores:
-            from app.core.tracking import TrackingPage, TrackingType
-            from app.core.tracking.tracker import track
+            from app.evaluation import record_evaluation, update_meta
 
-            role = eval_settings.model or ""
-            for metric, score in result.scores.items():
-                await track(
-                    TrackingType.EVALUATION,
-                    TrackingPage.EVALUATION,
-                    model=role,
-                    p0="GeneralEvaluator",
-                    p1=metric,
-                    p2=str(score),
-                    p3=str(result.passed).lower(),
-                )
+            update_meta(judge_model=eval_settings.model or "")
+            await record_evaluation(
+                evaluator="GeneralEvaluator",
+                node="general_agent",
+                metric_scores=result.scores,
+                rationales=result.rationales,
+                passed=result.passed,
+                judge_model=eval_settings.model or "",
+                trace_id=trace_id,
+                prompt_input=_prompt_input,
+                output_payload={"task_info": task_info, "history_tail": (eval_input.history or [])[-5:]},
+                extra_meta={"policy_reason": _decision.reason, "policy_signals": _decision.signals},
+            )
     except Exception as exc:
         logger.warning("General evaluation skipped: %s", exc)

@@ -416,6 +416,50 @@ export function monitorQuery(p) {
   return request(`/query?${qs.toString()}`, {}, MONITOR)
 }
 
+// ---------------------------------------------------------------------------
+// 评估闭环（/monitor/evaluations/*）
+// ---------------------------------------------------------------------------
+
+/** 按维度聚合评估结果（prompt 版本 / 模型 / 技能 / 节点…） */
+export function monitorEvalSummary({ dimension = 'run_prompt_version', metric = '', evaluator = '', start = '', end = '' } = {}) {
+  const qs = new URLSearchParams({ dimension })
+  if (metric) qs.set('metric', metric)
+  if (evaluator) qs.set('evaluator', evaluator)
+  if (start) qs.set('start', start)
+  if (end) qs.set('end', end)
+  return request(`/evaluations/summary?${qs}`, {}, MONITOR)
+}
+
+/** 评估指标按天趋势 */
+export function monitorEvalTrend({ metric = '', dimension = 'run_prompt_version', start = '', end = '' } = {}) {
+  const qs = new URLSearchParams({ metric, dimension })
+  if (start) qs.set('start', start)
+  if (end) qs.set('end', end)
+  return request(`/evaluations/trend?${qs}`, {}, MONITOR)
+}
+
+/** 低分案例（含完整上下文，可直接拿去改 prompt/技能） */
+export function monitorEvalBadCases({ metric = '', evaluator = '', limit = 20 } = {}) {
+  const qs = new URLSearchParams({ limit })
+  if (metric) qs.set('metric', metric)
+  if (evaluator) qs.set('evaluator', evaluator)
+  return request(`/evaluations/bad-cases?${qs}`, {}, MONITOR).then((d) => d?.cases ?? [])
+}
+
+/** 用户显式反馈（👍/👎） */
+export function monitorEvalFeedback(limit = 50) {
+  return request(`/evaluations/feedback?limit=${limit}`, {}, MONITOR).then((d) => d?.feedback ?? [])
+}
+
+/** 提交对某条助手消息的反馈 */
+export function submitFeedback(sessionId, { rating, comment = '' }, messageId = null) {
+  const qs = messageId ? `?message_id=${messageId}` : ''
+  return request(`/${sessionId}/feedback${qs}`, {
+    method: 'POST',
+    body: JSON.stringify({ rating, comment }),
+  })
+}
+
 /** 用户 token 消耗汇总（按模型） */
 export function monitorTokenUsage(userId) {
   return request(`/token-usage?user_id=${encodeURIComponent(userId)}`, {}, MONITOR).then(

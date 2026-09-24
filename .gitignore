@@ -35,3 +35,5 @@ htmlcov/
 .trae/
 .idea/
 *.swp
+# 评测跑批报告（本地产物）
+reports/

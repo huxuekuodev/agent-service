@@ -8,7 +8,7 @@ const props = defineProps({
   streaming: { type: Boolean, default: false },
 })
 
-const emit = defineEmits(['send', 'stop'])
+const emit = defineEmits(['send', 'stop', 'feedback'])
 
 const input = ref('')
 const listEl = ref(null)
@@ -56,6 +56,16 @@ watch(
         <div class="avatar" v-if="m.role === 'assistant'">{{ m.avatar }}</div>
         <div class="bubble">
           <div class="bubble-text">{{ m.content }}</div>
+          <div v-if="m.role === 'assistant' && m.content && !streaming" class="feedback">
+            <template v-if="m.feedback">
+              <span class="fb-done">{{ m.feedback === 'up' ? '👍 已记录' : '👎 已记录' }}</span>
+            </template>
+            <template v-else>
+              <span class="fb-hint">这个回答有帮助吗？</span>
+              <button class="fb-btn" title="有帮助" @click="emit('feedback', { index: i, rating: 'up' })">👍</button>
+              <button class="fb-btn" title="没帮助" @click="emit('feedback', { index: i, rating: 'down' })">👎</button>
+            </template>
+          </div>
         </div>
       </div>
 
@@ -89,6 +99,34 @@ watch(
 </template>
 
 <style scoped>
+.feedback {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.fb-hint {
+  opacity: 0.85;
+}
+
+.fb-btn {
+  padding: 2px 6px;
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.2;
+}
+
+.fb-btn:hover {
+  background: rgba(0, 0, 0, 0.06);
+}
+
+.fb-done {
+  color: var(--accent);
+}
+
 .chat {
   display: flex;
   flex-direction: column;
