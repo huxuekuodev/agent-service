@@ -47,6 +47,7 @@ __all__ = [
     "get_session",
     "list_sessions",
     "update_session",
+    "update_session_meta",
     "soft_delete_session",
     # 消息
     "append_message",
@@ -349,6 +350,18 @@ async def update_session(
         )
         row = await cur.fetchone()
     return _session_dict(row) if row else None
+
+
+async def update_session_meta(session_id: str, *, user_id: str, patch: dict[str, Any]) -> None:
+    """合并写入会话 meta（用于跨请求保存评估链 id 等轻量状态）。"""
+    import json
+
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            "UPDATE sessions SET meta = meta || %s::jsonb WHERE id = %s AND user_id = %s AND deleted_at IS NULL",
+            (json.dumps(patch, ensure_ascii=False), session_id, user_id),
+        )
 
 
 async def soft_delete_session(session_id: str, *, user_id: str) -> dict[str, Any] | None:

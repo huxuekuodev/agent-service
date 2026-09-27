@@ -74,6 +74,7 @@ async def record_evaluation(
     *,
     evaluator: str,
     node: str,
+    trigger: str = "",
     metric_scores: dict[str, float],
     rationales: dict[str, str] | None = None,
     passed: bool | None = None,
@@ -108,6 +109,7 @@ async def record_evaluation(
     coro = _record_now(
         evaluator=evaluator,
         node=node,
+        trigger=trigger,
         metric_scores=metric_scores,
         rationales=rationales or {},
         passed=passed,
@@ -127,6 +129,7 @@ async def _record_now(
     *,
     evaluator: str,
     node: str,
+    trigger: str = "",
     metric_scores: dict[str, float],
     rationales: dict[str, str],
     passed: bool | None,
@@ -146,6 +149,8 @@ async def _record_now(
             "message_id": meta.message_id,
             "node": resolved_node,
             "evaluator": evaluator,
+            "trigger": trigger,
+            "run_id": meta.run_id,
             "metric": metric,
             "score": float(score),
             "passed": passed,
@@ -171,6 +176,8 @@ async def _record_now(
                 {
                     "evaluator": evaluator,
                     "node": resolved_node,
+                    "trigger": trigger,
+                    "run_id": meta.run_id,
                     "metric_scores": dict(metric_scores),
                     "rationales": dict(rationales),
                     "passed": passed,
@@ -190,6 +197,14 @@ async def _record_now(
         except Exception as exc:
             logger.warning("[evaluation] sink 处理失败: {}", exc)
 
+    # 0.5) 链级计数（阈值 max_evals_per_run 用）
+    try:
+        from app.evaluation.policy import note_eval
+
+        note_eval(meta.run_id)
+    except Exception:  # 计数失败不影响记录
+        pass
+
     # 1) 打点：补上身份与版本（p4 会话 / p5 计划或任务 / p6 prompt 版本 / p7 被评模型）
     try:
         from app.core.tracking import TrackingPage, TrackingType
@@ -208,6 +223,8 @@ async def _record_now(
                 p5=meta.plan_id or meta.task_id,
                 p6=meta.run_prompt_version,
                 p7=meta.run_model,
+                p8=trigger,
+                p9=meta.run_id,
             )
     except Exception as exc:
         logger.warning("[evaluation] 打点失败: {}", exc)

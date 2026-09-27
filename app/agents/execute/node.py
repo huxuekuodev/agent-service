@@ -18,12 +18,12 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 from langchain_core.runnables import RunnableConfig
 from langgraph.runtime import Runtime
 
-from app.agents.evaluation.general_evaluator import maybe_evaluate_general
-from app.agents.events import Output, StepStatus, ToolCallAccumulator
-from app.agents.lead_agent import GraphContext
+from app.agents.common.events import Output, StepStatus, ToolCallAccumulator
+from app.agents.evaluators.general_evaluator import maybe_evaluate_general
+from app.agents.graph import GraphContext
 from app.agents.skills import is_skills_enabled, load_skill_context_by_id, sandbox_available, validate_skill
-from app.agents.subtask import SubTask
-from app.agents.thread_state import ThreadState
+from app.agents.state.subtask import SubTask
+from app.agents.state.thread_state import ThreadState
 from app.agents.tools import describe_execute_tools_v2, get_execute_tools, load_config_tools
 from app.core.context import trace_id_ctx_var
 from app.core.log import logger
@@ -131,11 +131,13 @@ async def general_agent(state: ThreadState, config: RunnableConfig, runtime: Run
 
     if status == "failed":
         out.step(plan_id=plan_id, name=task_name, status=StepStatus.FAILED, detail=error_info or "执行失败")
+        await _close_skill_sandbox(task_skill_id)  # 任务结束即删容器（不依赖 LLM 主动调 sandbox_close）
         return {"plan_tasks": [SubTask(plan_id=plan_id, step_statuses="failed", blocked_message=error_info or "执行失败")]}
 
     final_msg = agent_msgs[-1] if agent_msgs else AIMessage(content="")
     task_result = final_msg.content if hasattr(final_msg, "content") else str(final_msg)
     out.step(plan_id=plan_id, name=task_name, status=StepStatus.COMPLETED, detail=str(task_result), skill_id=task_skill_id)
+    await _close_skill_sandbox(task_skill_id)  # 技能任务结束 → 删除一次性沙箱容器（宿主机技能目录保留，当天复用）
 
     # === 2.1 执行节点评估（LLM-as-Judge，非致命）===
     # 评估执行 agent 的工具调用路径效率；未配置 / 被禁用 / 失败时静默跳过，不影响主流程。
@@ -231,6 +233,24 @@ async def _run_skill_probe(plan_tasks: list[SubTask]) -> str:
     except Exception as exc:  # 校验失败不阻塞主流程，下游会看到失败说明
         logger.warning("技能前置校验异常 (skill_id=%s): %s", skill_id, exc)
         return f"技能「{skill_id}」前置校验异常: {exc}"
+
+
+async def _close_skill_sandbox(skill_id: str) -> None:
+    """技能任务结束后回收沙箱（框架保证，不依赖 LLM 主动调用 sandbox_close）。
+
+    - Docker 后端：删除本次任务的一次性容器；宿主机技能目录保留，当天复用不重传；
+    - 会话不存在/回收失败都只记日志，不影响任务结果。
+    """
+    if not skill_id or not is_skills_enabled():
+        return
+    try:
+        from app.agents.skills import get_session_manager
+
+        closed = await get_session_manager().close(skill_id)
+        if closed:
+            logger.info("[skill-sandbox] 任务结束已回收沙箱: skill={}", skill_id)
+    except Exception as exc:
+        logger.warning("[skill-sandbox] 任务结束回收沙箱失败（忽略）: skill={} err={}", skill_id, exc)
 
 
 async def _load_general_system_prompt(langfuse_client: Any, tools_desc: str) -> tuple[str, str]:

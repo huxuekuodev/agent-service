@@ -6,10 +6,10 @@
   - 内置评估器：PlanEvaluator（plan_evaluator.py）
 """
 
-from app.agents.evaluation.base import BaseEvaluationResult, BaseEvaluator, MetricConfig, MetricOutcome
-from app.agents.evaluation.general_evaluator import GeneralEvaluationInput, GeneralEvaluator, maybe_evaluate_general
-from app.agents.evaluation.plan_evaluator import EvaluationInput, PlanEvaluator, maybe_evaluate_plan
-from app.agents.evaluation.registry import create_evaluator, create_evaluator_from_settings
+from app.agents.evaluators.base import BaseEvaluationResult, BaseEvaluator, MetricConfig, MetricOutcome
+from app.agents.evaluators.general_evaluator import GeneralEvaluationInput, GeneralEvaluator, maybe_evaluate_general
+from app.agents.evaluators.plan_evaluator import EvaluationInput, PlanEvaluator, maybe_evaluate_plan
+from app.agents.evaluators.registry import create_evaluator, create_evaluator_from_settings
 
 __all__ = [
     "BaseEvaluationResult",

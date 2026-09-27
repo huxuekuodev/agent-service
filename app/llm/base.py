@@ -39,7 +39,7 @@ class LLMInstance:
     渠道类不支持该参数时 factory 自动跳过（不会因此构建失败）。
     """
     supports_thinking: bool = False
-    """是否支持 thinking（规划/执行节点是否可开启）。"""
+    """是否支持 thinking（声明性能力标注；当前渠道的思考模式由服务端/模型决定）。"""
     supports_vision: bool = False
     """是否支持视觉输入（知识库图片转文字用）。"""
     display_name: str = ""

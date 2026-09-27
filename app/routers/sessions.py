@@ -270,9 +270,11 @@ async def chat_sync(
     collector = AssistantReplyCollector()
     usage = UsageCollector()
     started = time.perf_counter()
-    identity = _bind_run_identity(user_id=str(user["user_id"]), session=session, channel="voice" if req.voice else "chat")
+    run_id = _new_run_id()
+    await sessions.set_eval_run_id(session, run_id)
+    identity = _bind_run_identity(user_id=str(user["user_id"]), session=session, channel="voice" if req.voice else "chat", run_id=run_id)
     try:
-        async for event in svc.stream(session["thread_id"], req.message, usage=usage, voice=req.voice):
+        async for event in svc.stream(session["thread_id"], req.message, usage=usage, voice=req.voice, run_id=run_id):
             collector.feed(event)
     except Exception as exc:
         logger.error("同步对话失败: session={} err={}", session_id, exc)
@@ -323,9 +325,12 @@ async def chat_stream(
         interrupt_payload: dict[str, Any] = {}
         from app.evaluation import reset_meta
 
-        identity = _bind_run_identity(user_id=str(user["user_id"]), session=session, channel="voice" if req.voice else "chat")
+        # 开一条评估链（写进会话 meta：本轮若被 interrupt 打断，/resume 会复用它，链条不断）
+        run_id = _new_run_id()
+        await sessions.set_eval_run_id(session, run_id)
+        identity = _bind_run_identity(user_id=str(user["user_id"]), session=session, channel="voice" if req.voice else "chat", run_id=run_id)
         try:
-            async for chunk in svc.stream(thread_id, req.message, usage=usage, voice=req.voice):
+            async for chunk in svc.stream(thread_id, req.message, usage=usage, voice=req.voice, run_id=run_id):
                 if not isinstance(chunk, dict):
                     continue
                 collector.feed(chunk)
@@ -410,9 +415,10 @@ async def resume_session(
         interrupt_payload: dict[str, Any] = {}
         from app.evaluation import reset_meta
 
-        identity = _bind_run_identity(user_id=str(user["user_id"]), session=session, channel="voice" if req.voice else "chat")
+        run_id = sessions.eval_run_id(session)
+        identity = _bind_run_identity(user_id=str(user["user_id"]), session=session, channel="voice" if req.voice else "chat", run_id=run_id)
         try:
-            async for chunk in svc.stream(thread_id, resume=payload, usage=usage, voice=req.voice):
+            async for chunk in svc.stream(thread_id, resume=payload, usage=usage, voice=req.voice, run_id=run_id):
                 if not isinstance(chunk, dict):
                     continue
                 collector.feed(chunk)
@@ -479,7 +485,14 @@ async def _voice_frames(text: str):
     yield f"data: {_serialize(ok(data={'type': 'voice_end'}))}\n\n"
 
 
-def _bind_run_identity(*, user_id: str, session: dict[str, Any], channel: str, message_id: int | None = None) -> Any:
+def _new_run_id() -> str:
+    """生成一条评估链 id（一次用户回合一个；/resume 会复用它）。"""
+    from app.evaluation import new_run_id
+
+    return new_run_id()
+
+
+def _bind_run_identity(*, user_id: str, session: dict[str, Any], channel: str, message_id: int | None = None, run_id: str = "") -> Any:
     """把本轮运行的"身份"写进评估上下文（见 app/evaluation/context.py）。
 
     评估要能回答"这条分属于哪次对话/哪条消息/什么渠道"，否则只能看平均分。
@@ -493,6 +506,7 @@ def _bind_run_identity(*, user_id: str, session: dict[str, Any], channel: str, m
         thread_id=session.get("thread_id", ""),
         channel=channel,
         message_id=message_id,
+        run_id=run_id or None,
     )
 
 

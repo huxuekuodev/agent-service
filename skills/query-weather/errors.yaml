@@ -8,6 +8,6 @@ errors:
     action: human
     note: 城市编码不存在请回 step-01 重新取码；API Key 问题提示用户配置 QWEATHER_API_KEY
   - code: SANDBOX_UNAVAILABLE
-    condition: E2B 沙箱不可用（缺 template / E2B_API_KEY / 未装可选依赖）
+    condition: 沙箱不可用（Docker 连不上 / 镜像缺失；或 e2b 后端缺 template 与 E2B_API_KEY）
     action: human
-    note: 提示配置 skills.sandbox（template + E2B_API_KEY + uv sync --extra sandbox）
+    note: 检查 skills.sandbox（backend=docker 时看 docker_url / docker_image；e2b 时看 template + E2B_API_KEY），并确认依赖已安装（uv sync）

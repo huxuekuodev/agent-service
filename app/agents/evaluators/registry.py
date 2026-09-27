@@ -4,14 +4,14 @@
 根据 config.yaml 的 ``evaluators`` 列表，把每个评估器配置实例化为
 BaseEvaluator 子类对象：
 
-  - ``use``: BaseEvaluator 子类的 import 路径（如 ``app.agents.evaluation.plan_evaluator:PlanEvaluator``）。
+  - ``use``: BaseEvaluator 子类的 import 路径（如 ``app.agents.evaluators.plan_evaluator:PlanEvaluator``）。
   - ``model``: 评估 LLM 在 ``models`` 列表里的 name；省略时用默认模型（即第一个）。
   - ``display_name``: 传给子类的 ``name``（Langfuse observation 名 ``evaluation/{name}``）。
   - ``system_prompt`` / ``metrics`` / ``sample_rate`` / ``extra``: 原样透传给子类 __init__。
 
 用法：
 
-    from app.agents.evaluation.registry import create_evaluator
+    from app.agents.evaluators.registry import create_evaluator
     evaluator = create_evaluator("plan_evaluation", app_config, llm_factory=create_llm_with_name)
     result = await evaluator.evaluate(trace_id=..., prompt_input=..., config=...)
 """
@@ -22,7 +22,7 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
-from app.agents.evaluation.base import BaseEvaluator
+from app.agents.evaluators.base import BaseEvaluator
 from app.config import AppConfig, EvaluatorSettings
 from app.core.reflection import resolve_class
 

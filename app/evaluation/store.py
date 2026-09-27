@@ -50,8 +50,8 @@ async def insert_evaluations(rows: list[dict[str, Any]]) -> int:
             for row in rows:
                 await cur.execute(
                     "INSERT INTO evaluations (trace_id, session_id, message_id, node, evaluator, metric, score, passed, rationale, "
-                    "plan_id, task_id, skill_id, run_model, run_prompt_version, judge_model, judge_prompt_version, git_sha, channel, meta) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
+                    "plan_id, task_id, skill_id, run_model, run_prompt_version, judge_model, judge_prompt_version, git_sha, channel, run_id, trigger, meta) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
                     (
                         row.get("trace_id", ""),
                         row.get("session_id") or None,
@@ -71,6 +71,8 @@ async def insert_evaluations(rows: list[dict[str, Any]]) -> int:
                         row.get("judge_prompt_version", "") or "",
                         row.get("git_sha", "") or "",
                         row.get("channel", "chat") or "chat",
+                        row.get("run_id", "") or "",
+                        row.get("trigger", "") or "",
                         json.dumps(row.get("meta") or {}, ensure_ascii=False),
                     ),
                 )
@@ -183,6 +185,25 @@ async def trend_by_metric(
     pool = await _pool()
     async with pool.connection() as conn:
         cur = await conn.execute(sql, tuple(params))
+        rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def list_runs(*, session_id: str = "", limit: int = 20) -> list[dict[str, Any]]:
+    """按评估链（run_id）汇总：一次用户回合触发了哪些评估点、各指标均分。
+
+    用于验证"触发即完整链条"：正常一次回合应能看到 plan_done / task_done / final_answer。
+    """
+    pool = await _pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT run_id, session_id, count(*) AS rows, count(DISTINCT trigger) AS triggers, "
+            "array_agg(DISTINCT trigger) AS trigger_list, round(avg(score)::numeric, 3) AS avg_score, "
+            "to_char(min(created_at), 'YYYY-MM-DD\"T\"HH24:MI:SS') AS started_at "
+            "FROM evaluations WHERE (%s = '' OR session_id = %s::uuid) AND run_id <> '' "
+            "GROUP BY run_id, session_id ORDER BY min(created_at) DESC LIMIT %s",
+            (session_id, session_id, max(1, min(limit, 100))),
+        )
         rows = await cur.fetchall()
     return [dict(r) for r in rows]
 

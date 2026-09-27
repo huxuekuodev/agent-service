@@ -2,7 +2,7 @@
 规划节点评估器（LLM-as-Judge）。
 
 对 plan_model_node 的规划输出做评估。基于 BaseEvaluator 抽象，通过 config.yaml
-的 ``evaluators`` 列表注册（use: app.agents.evaluation.plan_evaluator:PlanEvaluator）。
+的 ``evaluators`` 列表注册（use: app.agents.evaluators.plan_evaluator:PlanEvaluator）。
 
 Prompt 来源（唯一来源，不在代码中写死）：
   - Langfuse Prompt ``plan_evaluator_prompt``（文本类型，占位符
@@ -22,7 +22,7 @@ Prompt 来源（唯一来源，不在代码中写死）：
     evaluators:
       - name: plan_evaluation
         display_name: "规划评估"
-        use: app.agents.evaluation.plan_evaluator:PlanEvaluator
+        use: app.agents.evaluators.plan_evaluator:PlanEvaluator
         model: evaluate_model
         enabled: true
         sample_rate: 1.0
@@ -44,7 +44,7 @@ import json
 import logging
 from typing import Any
 
-from app.agents.evaluation.base import BaseEvaluator, MetricConfig
+from app.agents.evaluators.base import BaseEvaluator, MetricConfig
 
 logger = logging.getLogger(__name__)
 
@@ -298,8 +298,33 @@ async def maybe_evaluate_plan(
     与 ``general_evaluator.maybe_evaluate_general`` 保持一致的触发模式：
     直接从 config 读 ``plan_evaluation`` 评估器设置，未配置则跳过（不引入旧配置兼容分支）。
     """
+    # 判定点在"调用 agent 那一层"定阈值；通过后**整条评估（judge + 落库）放后台**，节点立即返回
+    from app.evaluation import decide_trigger
+    from app.evaluation.recorder import submit_background
+
+    decision = decide_trigger("plan_done")
+    if not decision.should:
+        logger.debug("[evaluation] 跳过规划评估: %s", decision.reason)
+        return
+
+    submit_background(
+        _evaluate_plan_and_record(trace_id=trace_id, eval_input=eval_input, messages=messages, config=config, runtime=runtime, decision_reason=decision.reason),
+        what="plan_done",
+    )
+
+
+async def _evaluate_plan_and_record(
+    *,
+    trace_id: str,
+    eval_input: EvaluationInput,
+    messages: list[Any],
+    config: Any,
+    runtime: Any,
+    decision_reason: str = "",
+) -> None:
+    """真正的规划评估（后台执行）：judge → 记录（落库 + 打点 + 低分归档）。"""
     try:
-        from app.agents.evaluation.registry import create_evaluator
+        from app.agents.evaluators.registry import create_evaluator
         from app.llm import create_llm_with_name
 
         context = runtime.context
@@ -307,14 +332,6 @@ async def maybe_evaluate_plan(
 
         eval_settings = app_config.get_evaluator("plan_evaluation")
         if eval_settings is None or not eval_settings.enabled:
-            return
-
-        # 策略门：值得评才评（replan / 失败 / 澄清 / 首轮 / 追问 / 多任务 / 用技能），其余抽样
-        from app.evaluation import current_meta, decide
-
-        decision = decide(signals=current_meta().signals, sample_rate=eval_settings.sample_rate)
-        if not decision.should:
-            logger.debug("[evaluation] 跳过规划评估: %s", decision.reason)
             return
 
         def _build_judge_llm(model_name: str | None) -> Any | None:
@@ -349,6 +366,7 @@ async def maybe_evaluate_plan(
             await record_evaluation(
                 evaluator="PlanEvaluator",
                 node="plan_node",
+                trigger="plan_done",
                 metric_scores=result.scores,
                 rationales=result.rationales,
                 passed=result.passed,
@@ -356,7 +374,7 @@ async def maybe_evaluate_plan(
                 trace_id=trace_id,
                 prompt_input=prompt_input,
                 output_payload={"plan_action": eval_input.plan_action, "tasks": eval_input.tasks, "clarification_requested": eval_input.clarification_requested},
-                extra_meta={"policy_reason": decision.reason, "policy_signals": decision.signals},
+                extra_meta={"policy_reason": decision_reason},
             )
     except Exception as exc:
         logger.warning("Plan evaluation skipped: %s", exc)

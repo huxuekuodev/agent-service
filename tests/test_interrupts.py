@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 
-from app.agents.interrupts import DEFAULT_QUESTION_ID, AskAnswer, build_ask, extract_interrupt, parse_answer, question_of
-from app.agents.subtask import SubTask
-from app.agents.thread_state import merge_plan_tasks
+from app.agents.common.interrupts import DEFAULT_QUESTION_ID, AskAnswer, build_ask, extract_interrupt, parse_answer, question_of
+from app.agents.state.subtask import SubTask
+from app.agents.state.thread_state import merge_plan_tasks
 
 # --------------------------------------------------------------------------- 协议：问什么
 

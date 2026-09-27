@@ -24,14 +24,14 @@ def _build_serde() -> Any:
 
     LangGraph 反序列化未登记的自定义类型时会告警并提示未来将禁用（或要求
     ``LANGGRAPH_STRICT_MSGPACK=true``）。这里显式允许本项目自定义类型
-    （如 ``app.agents.subtask.SubTask``），避免依赖环境变量开关。
+    （如 ``app.agents.state.subtask.SubTask``），避免依赖环境变量开关。
     """
     from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
     return JsonPlusSerializer(
         allowed_msgpack_modules=[
-            ("app.agents.subtask", "SubTask"),
-            "app.agents.subtask",
+            ("app.agents.state.subtask", "SubTask"),
+            "app.agents.state.subtask",
         ]
     )
 

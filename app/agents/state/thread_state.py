@@ -18,7 +18,7 @@ from langchain_core.messages import BaseMessage
 from langgraph.graph import add_messages
 from typing_extensions import TypedDict
 
-from app.agents.subtask import SubTask
+from app.agents.state.subtask import SubTask
 
 # 状态字段：总是允许覆盖（执行进度由执行节点回写）
 _MUTABLE_FIELDS = {"step_statuses", "result", "blocked_message"}

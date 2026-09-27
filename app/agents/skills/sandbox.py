@@ -57,6 +57,17 @@ class SandboxConfig:
     max_files: int = 2000
     """单次同步文件数上限（防误传整棵树）。"""
 
+    # ---- Docker 后端（默认，见 app/agents/skills/docker_sandbox.py）----
+    backend: str = "docker"
+    docker_url: str = ""
+    docker_image: str = "python:3.11"
+    docker_network_mode: str = "host"
+    host_tmp_dir: str = "/tmp/deer-skills"
+    mem_limit: str = "256m"
+    pids_limit: int = 128
+    tmpfs_size: str = "64m"
+    keep_host_files_days: int = 2
+
     @classmethod
     def from_app_config(cls) -> SandboxConfig:
         try:
@@ -70,6 +81,15 @@ class SandboxConfig:
                 max_output_chars=sb.max_output_chars,
                 env_keys=list(sb.env_keys),
                 exclude_patterns=list(sb.exclude_patterns),
+                backend=getattr(sb, "backend", "docker"),
+                docker_url=getattr(sb, "docker_url", ""),
+                docker_image=getattr(sb, "docker_image", "python:3.11"),
+                docker_network_mode=getattr(sb, "docker_network_mode", "host"),
+                host_tmp_dir=getattr(sb, "host_tmp_dir", "/tmp/deer-skills"),
+                mem_limit=getattr(sb, "mem_limit", "256m"),
+                pids_limit=getattr(sb, "pids_limit", 128),
+                tmpfs_size=getattr(sb, "tmpfs_size", "64m"),
+                keep_host_files_days=getattr(sb, "keep_host_files_days", 2),
             )
         except Exception:
             return cls()
@@ -124,11 +144,18 @@ def _import_e2b() -> Any:
 def sandbox_available() -> tuple[bool, str]:
     """沙箱是否可用：(可用?, 不可用原因，含修复指引)。
 
-    只做**环境校验**（配置 + 依赖 + Key），不创建沙箱——用于执行前的前置检查。
+    只做**环境校验**（配置 + 依赖 + 镜像/Key），不创建沙箱——用于执行前的前置检查。
+    按 ``skills.sandbox.backend`` 分派：docker（默认）/ e2b。
     """
     from app.config import get_app_config
 
     sb = get_app_config().skills.sandbox
+    if str(getattr(sb, "backend", "docker")).lower() == "docker":
+        from app.agents.skills.docker_sandbox import docker_available
+
+        if not sb.enabled:
+            return False, "skills.sandbox.enabled=false（config.yaml，需改为 true）"
+        return docker_available(SandboxConfig.from_app_config())
     if not sb.enabled:
         return False, "skills.sandbox.enabled=false（config.yaml，需改为 true）"
     if not sb.template:

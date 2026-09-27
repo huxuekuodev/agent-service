@@ -87,6 +87,21 @@ async def evaluations_trend(
     return ok({"metric": metric, "dimension": dimension, "rows": rows})
 
 
+@router.get("/evaluations/runs")
+async def evaluations_runs(
+    session_id: str = Query("", description="按会话过滤（空=最近所有会话）"),
+    limit: int = Query(20, ge=1, le=100),
+) -> dict[str, Any]:
+    """评估链视图：一次用户回合触发了哪些评估点（验证"触发即完整链条"）。"""
+    try:
+        from app.evaluation import store as eval_store
+
+        rows = await eval_store.list_runs(session_id=session_id, limit=limit)
+    except Exception as exc:
+        raise _store_or_500(exc) from exc
+    return ok({"runs": rows})
+
+
 @router.get("/evaluations/bad-cases")
 async def evaluations_bad_cases(
     metric: str = Query("", description="指标名过滤"),

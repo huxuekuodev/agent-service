@@ -8,6 +8,8 @@
 
 主图流程：`plan_model_node`（澄清/规划/审查，可选 LLM-as-Judge 评估）→ `step_dispatch_node`（按 DAG 依赖筛选就绪任务）→ `step_fan_out_router`（`Send` 并行派发）→ `general_agent`（执行单个任务并写回结果）→ 循环直至 `END`。
 
+计划协议：模型通过 **`submit_plan` 工具**提交计划（参数经 pydantic 校验 + DAG 拓扑校验），不使用 LangChain 的 `response_format` 结构化输出——thinking 渠道不允许强制 `tool_choice`，业务契约不该依赖渠道特性（见 docs/规划协议方案.md）。
+
 ## 技术栈
 
 | 类别 | 技术 |
@@ -85,16 +87,37 @@ agent-service/
     │   ├── builders.py       # create_llm / create_llm_with_name / create_execution_llm（按运行配置构建）
     │   ├── usage.py          # UsageCollector：callback 采集一次请求全部模型调用的 token 用量（按问题/按用户计量的数据源）
     │   └── instances/        # 渠道实例：deepseek / deepseek_bak / openai / qwen（stream_usage=True 才能拿到用量）
-    ├── agents/
-    │   ├── thread_state.py   # LangGraph 线程状态定义（messages + plan_tasks，reducer）
-    │   ├── subtask.py        # SubTask 数据模型（DAG 子任务）
-    │   ├── interrupts.py     # 中断/恢复协议：build_ask 载荷 + answers 解析（多问题可扩展）
-    │   ├── plan_document.py  # Plan DAG 数据模型（v1 遗留，StepStatus 等）
-    │   ├── plan_storage.py   # Plan 存储抽象（内存/Redis 后端，v1 遗留）
-    │   ├── plan_toolkit.py   # Plan 工具集 v2：create/update/get_plan_status（ContextVar 桥接）
-    │   ├── skills/           # SKILL 能力：技能库 + 沙箱会话（registry/loader/sandbox/session/tools，见 docs/SKILL_方案.md）
-    │   │                     # 技能=整体执行单元（任务上标 skill_id）：load_skill 读整份 SKILL →
-    │   │                     # sandbox_create → sandbox_run → sandbox_close；规划节点不再做技能错误恢复
+    ├── agents/               # agent 编排域：按「图节点 / 共享设施」分目录
+    │   ├── plan/             # 规划域（见 docs/规划协议方案.md）
+    │   │   ├── schema.py     # 计划契约：PlanTask / PlanOutput + DAG 不变式（唯一 id、依赖存在、无环、action 自洽）
+    │   │   ├── dag.py        # DAG 运行期操作：契约→SubTask、拓扑校验/修复、技能探测注入、就绪筛选（与派发共用）
+    │   │   ├── protocol.py   # submit_plan 工具（args_schema=PlanOutput）+ 「提交即终态」中间件（不依赖任何渠道特性）
+    │   │   ├── prompt.py     # 系统提示词（Langfuse）+ 执行能力/技能索引注入
+    │   │   └── node.py       # 规划节点：澄清 + 规划 + 审查
+    │   ├── dispatch/
+    │   │   └── node.py       # 派发节点：筛选就绪任务 + fan-out 路由（Send/END）+ 计划确认中断
+    │   ├── execute/
+    │   │   └── node.py       # 执行节点（general_agent）：执行单任务并写回结果（含执行评估触发）
+    │   ├── graph/
+    │   │   ├── agent.py      # 主图 GraphAgent（无状态编译图 + Send 并行派发 + 规划节点重试策略）
+    │   │   └── context.py    # GraphContext（app_config / plan_llm / langfuse_client 注入）
+    │   ├── state/
+    │   │   ├── thread_state.py  # LangGraph 线程状态定义（messages + plan_tasks，reducer）
+    │   │   └── subtask.py       # SubTask 运行期任务模型（DAG 节点 + 执行状态/结果）
+    │   ├── common/           # 跨节点共享设施
+    │   │   ├── events.py     # 节点→前端统一事件输出层（EventType/Output/ToolCallAccumulator）
+    │   │   ├── errors.py     # LLM 错误分类（可重试 vs 不可恢复）+ 兜底提示
+    │   │   ├── interrupts.py # 中断/恢复协议：build_ask 载荷 + answers 解析（多问题可扩展）
+    │   │   └── current_time.py  # <current_time> 注入辅助（避免重复注入，可单测）
+    │   ├── middlewares/
+    │   │   ├── clarification_middleware.py   # 拦截 ask_clarification 并呈现给用户
+    │   │   └── dangling_tool_call_middleware.py # 修复历史中悬空的 tool_call
+    │   ├── skills/           # SKILL 能力：技能库 + 沙箱（见 docs/SKILL_方案.md）
+    │   │                     # registry/loader（整技能读取）、sandbox（E2B 后端）、
+    │   │                     # docker_sandbox（**Docker 默认后端**：一次性容器 + 宿主目录按天缓存 +
+    │   │                     # 只读根/tmpfs + host 网络 + 超时 kill）、factory（按 backend 选择）、
+    │   │                     # session（会话：复用/TTL/并发/任务结束即回收）、tools（技能工具链）
+    │   │                     # 技能=整体执行单元：load_skill → sandbox_create → sandbox_run → sandbox_close
     │   ├── tools/            # 工具注册表（包）：按业务分类组织第三方工具
     │   │   ├── __init__.py   # 对外 API：get_plan_tools / get_execute_tools（自动追加技能工具链）等
     │   │   ├── registry.py   # 从 config `tools` 段加载工具类，按 allowed_agents 过滤
@@ -102,27 +125,14 @@ agent-service/
     │   │   ├── web/          # 联网类工具（web_search，基于 Tavily API）
     │   │   ├── knowledge/    # 知识库类工具（internal_kb 私有知识库示例）
     │   │   └── yuque/        # 语雀类工具（newest_doc 文档修订对比）
-    │   ├── events.py         # 节点→前端统一事件输出层（EventType/Output/ToolCallAccumulator）
-    │   ├── errors.py         # 规划节点 LLM 错误分类（可重试 vs 不可恢复）
-    │   ├── current_time.py   # <current_time> 注入辅助（避免重复注入，可单测）
-    │   ├── lead_agent/
-    │   │   ├── agent.py      # 主图 GraphAgent（无状态编译图 + Send 并行派发）
-    │   │   ├── graph_context.py  # GraphContext（app_config / plan_llm / langfuse_client 注入）
-    │   │   └── tools.py      # 步骤执行工具定义
-    │   ├── nodes/
-    │   │   ├── plan_model_node.py   # 规划节点：澄清 + 规划 + 审查（结构化输出 SubTask DAG）
-    │   │   ├── step_dispatch_node.py # 派发节点：筛选就绪任务 + fan-out 路由（Send/END）
-    │   │   └── constants.py  # 共享常量（thinkMessage 等）
-    │   ├── subagent/
-    │   │   └── general_agent.py  # 通用执行 agent：执行单任务并写回结果（含执行评估触发）
-    │   ├── middlewares/
-    │   │   ├── clarification_middleware.py   # 拦截 ask_clarification 并呈现给用户
-    │   │   └── dangling_tool_call_middleware.py # 修复历史中悬空的 tool_call
-    │   └── evaluation/
+    │   └── evaluators/       # 节点内评估器（config `evaluators` 里的 use 路径指向这里）
     │       ├── base.py       # BaseEvaluator 抽象基类（指标开关/阈值/LLM 打分/JSON 解析）
     │       ├── registry.py   # 评估器工厂（按 config `evaluators` 列表实例化）
-    │       ├── plan_evaluator.py  # PlanEvaluator：任务原子性/依赖正确性/决策准确性等（Langfuse plan_evaluator_prompt）
-    │       └── general_evaluator.py # GeneralEvaluator：执行节点路径效率（1-5 分）
+    │       ├── plan_evaluator.py  # PlanEvaluator：任务原子性/依赖正确性/决策准确性等
+    │       ├── general_evaluator.py # GeneralEvaluator：执行节点路径效率（1-5 分）
+    │       └── final_answer_evaluator.py # FinalAnswerEvaluator：最终答复质量
+    ├── integrations/         # 外部系统接入层（第三方 API 客户端，与 agent/rag 解耦）
+    │   └── yuque/            # 语雀 Open API v2 客户端（client.py）
     ├── routers/
     │   ├── auth.py           # 认证接口（register/login/refresh/logout/me/password）
     │   ├── sessions.py       # 会话与对话接口（增删改查/历史/chat SSE/chat sync/resume，JWT 鉴权 + 落库）
@@ -148,7 +158,8 @@ agent-service/
 - `make dev`：同时启动后端（http://127.0.0.1:8001，uvicorn --reload）与 Web（http://127.0.0.1:5173，vite dev，`/auth /sessions /monitor /health /knowledge` 代理到后端），Ctrl-C 一键全部停止
 - `make dev-api` / `make dev-web`：分别启动后端 / Web
 - `make lint`（ruff check + format --check）/ `make test`（pytest）/ `make build-web`（vite build）/ `make clean`（清理缓存）
-- 启用 SKILL 沙箱前需在宿主机安装可选依赖并配置（见 docs/SKILL_方案.md）：`uv sync --extra sandbox`
+- SKILL 沙箱默认走 **Docker 一次性容器**（依赖 `docker` + `paramiko`，`uv sync` 即可；
+  需在 `.env` 配 `DOCKER_HOST_URL`，见 docs/SKILL_方案.md §11）；回退云端 E2B：`uv sync --extra sandbox-e2b` + `skills.sandbox.backend=e2b`
 
 ## 项目规则
 - 当创建新的配置项时，确保`config.yaml` 和 `config.example.yaml` 都有对应的更新。

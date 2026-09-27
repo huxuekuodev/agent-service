@@ -33,10 +33,19 @@ skills:
   cleanup_default: confirm   # 产物清理默认等级：auto / confirm / forbidden
   max_candidates: 3          # 一次请求最多候选 skill 数
   sandbox:
-    enabled: false           # skill 自带脚本在 E2B 沙箱内运行；需要 .env 配 E2B_API_KEY / E2B_DOMAIN / E2B_TEMPLATE
-    template:                # E2B 模板名；留空时读环境变量 E2B_TEMPLATE
-    timeout: 3600            # 沙箱最长存活秒数
-    command_timeout: 120     # 单条命令默认超时秒数
+    # ---- 沙箱后端：docker（默认，一次性容器，省钱）/ e2b（云端，可选回退）----
+    backend: docker
+    docker_url: $DOCKER_HOST_URL        # ssh://user@host:22 或 unix:///var/run/docker.sock
+    docker_image: python:3.11           # 需已存在于目标 Docker 主机
+    docker_network_mode: host           # 技能脚本走宿主机网络（host/bridge/none）
+    host_tmp_dir: /tmp/deer-skills      # 宿主机技能目录根，按天分目录（当天复用不重传）
+    command_timeout: 5                  # 单条命令超时即 kill 容器（秒）
+    mem_limit: 256m                     # 容器内存上限
+    pids_limit: 128                     # 容器进程数上限
+    tmpfs_size: 64m                     # 容器内可写 /tmp 上限（根文件系统只读）
+    keep_host_files_days: 2             # 宿主技能目录保留天数
+    template:                # 仅 e2b 后端用：E2B 模板名（留空时读环境变量 E2B_TEMPLATE）
+    timeout: 3600            # 沙箱最长存活秒数（容器/会话总时长上限）
     # 沙箱会话空闲存活秒数（超时自动销毁；执行 agent 也可主动 sandbox_close）
     session_ttl_seconds: 1800
     # 同时存活的沙箱会话上限
@@ -101,13 +110,14 @@ plan_evaluation:
 # 评估器列表（推荐方式；每个评估器 = 一个 BaseEvaluator 子类实例）
 #   use: 子类 import 路径；model: models 列表里的 name；enabled: 总开关；
 #   metrics: 按指标名覆盖 {enabled / pass_score / label / description}。
+
 evaluators:
+  # 触发点 1：规划完成（规划质量：原子性/依赖/决策/变量/工具可行性）
   - name: plan_evaluation
     display_name: "规划评估"
-    use: app.agents.evaluation.plan_evaluator:PlanEvaluator
+    use: app.agents.evaluators.plan_evaluator:PlanEvaluator
     model: evaluate_model
-    # 系统提示词由 Langfuse prompt plan_evaluator_prompt 提供（唯一来源，
-    # 本地副本 app/prompts/plan_evaluator_prompt.md 仅保存参考，不读取）。
+    # 系统提示词唯一来源为 Langfuse prompt plan_evaluator_prompt（本地副本仅参考）
     enabled: true
     sample_rate: 1.0
     metrics:
@@ -131,20 +141,47 @@ evaluators:
         label: "工具可行性"
         enabled: true
         pass_score: 3.0
+
+  # 触发点 2：每个任务完成（执行过程：路径效率/回复整洁度）
   - name: general_evaluation
     display_name: "执行评估"
-    use: app.agents.evaluation.general_evaluator:GeneralEvaluator
+    use: app.agents.evaluators.general_evaluator:GeneralEvaluator
     model: evaluate_model
-    # 系统提示词由 Langfuse prompt general_evaluator_prompt 提供（唯一来源，
-    # 本地副本 app/prompts/general_evaluator_prompt.md 仅保存参考，不读取）。
+    # 系统提示词唯一来源为 Langfuse prompt general_evaluator_prompt（本地副本仅参考）
     enabled: true
     sample_rate: 1.0
     metrics:
       path_efficiency:
+        label: "路径效率"
+        enabled: true
+        pass_score: 3.0
+      answer_cleanness:
+        label: "回复整洁度"
         enabled: true
         pass_score: 3.0
 
-# 执行 agent 配置
+  # 触发点 3：最终回复（用户唯一看到的产出：契合度/有据性/完整性）
+  - name: final_answer_evaluation
+    display_name: "最终回复评估"
+    use: app.agents.evaluators.final_answer_evaluator:FinalAnswerEvaluator
+    model: evaluate_model
+    # 系统提示词唯一来源为 Langfuse prompt final_answer_evaluator_prompt（本地副本仅参考）
+    enabled: true
+    sample_rate: 1.0
+    metrics:
+      question_fit:
+        label: "问题契合度"
+        enabled: true
+        pass_score: 3.0
+      groundedness:
+        label: "结果有据性"
+        enabled: true
+        pass_score: 3.0
+      completeness:
+        label: "完整性"
+        enabled: true
+        pass_score: 3.0
+
 subagents:
   custom_agents: {}
 
@@ -241,10 +278,19 @@ voice:
   timeout: 45                           # 单次 TTS 超时（秒）
 
 # 评估策略（见 docs/评估闭环方案.md）
-# worth_it：只在"出过问题/信息量大"的轮次评估（replan、失败任务、澄清、首轮、追问、多任务、用技能）
+# 三个触发点全部异步执行，阈值/采样在**调用 agent 时**一次性决定（节点内部不再判断）
 evaluation_policy:
-  mode: worth_it             # worth_it | always（全量） | off（不评）
-  baseline_sample_rate: 0.05 # 普通轮次的抽样率
-  async_enabled: true        # 评估放后台，不占对话延迟
+  mode: always               # always（测试阶段全触发）| worth_it（只评有信号轮次）| off
+  triggers:
+    plan_done: true          # 规划完成时评估
+    task_done: true          # 每个任务完成时评估
+    final_answer: true       # 最终回复时评估
+  thresholds:
+    sample_rate: 1.0         # 链级采样率（1.0 = 全跑）
+    min_task_count: 0        # 任务数达到该值才评任务（0 = 全部）
+    max_task_evals: 0        # 单链任务评估次数上限（0 = 不限）
+    max_evals_per_run: 0     # 单链评估总次数上限（0 = 不限）
+  baseline_sample_rate: 0.05 # worth_it 模式下普通轮次的抽样率
+  async_enabled: true        # 全部异步，不占对话延迟
   max_concurrency: 2         # 后台评估并发上限
   archive_bad_cases: true    # 低分样本连同完整上下文归档（改进原料）

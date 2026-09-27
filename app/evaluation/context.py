@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from typing import Any
 
-__all__ = ["RunMeta", "code_version", "current_meta", "reset_meta", "update_meta"]
+__all__ = ["RunMeta", "code_version", "current_meta", "new_run_id", "reset_meta", "update_meta"]
 
 run_meta_ctx_var: ContextVar[RunMeta | None] = ContextVar("run_meta", default=None)
 
@@ -45,6 +45,16 @@ class RunMeta:
     """本轮用户消息在 messages 表里的 id（落库后回填）。"""
     channel: str = "chat"
     """chat / voice / api。"""
+
+    # ---- 评估链（一次用户回合 = 一条链，三个触发点共享）----
+    run_id: str = ""
+    """评估链 id：规划完成 / 每种任务完成 / 最终回复 三次触发共享，便于看"完整链条"。"""
+    eval_enabled: bool = True
+    """本次运行是否纳入评估（在**调用 agent 的那一层**按阈值/采样一次性决定）。"""
+    eval_reason: str = ""
+    """为什么评/不评（写入记录，便于事后核对阈值是否合理）。"""
+    triggers: dict[str, bool] = field(default_factory=lambda: {"plan_done": True, "task_done": True, "final_answer": True})
+    """各触发点开关（测试阶段全开）。"""
 
     # ---- 被评对象（由节点写入）----
     node: str = ""
@@ -75,6 +85,13 @@ class RunMeta:
         data = self.to_dict()
         data.update({k: v for k, v in fields.items() if v is not None})
         return RunMeta(**data)
+
+
+def new_run_id() -> str:
+    """生成一条评估链的 id（一次用户回合一个）。"""
+    import uuid
+
+    return uuid.uuid4().hex[:16]
 
 
 def current_meta() -> RunMeta:

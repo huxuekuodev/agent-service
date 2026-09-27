@@ -15,17 +15,16 @@ Usage:
 """
 
 import asyncio
+import os
 import uuid
 
-from langchain_core.messages import (AIMessage, HumanMessage, SystemMessage,
-                                     ToolMessage)
+from langchain_core.messages import HumanMessage
 
-from app.agents.lead_agent.agent import GraphAgent
+from app.agents.graph.agent import GraphAgent
 from app.config import get_app_config
 from app.core.context import trace_id_ctx_var
 from app.core.log import logger
 from app.core.runtime import RunContext
-from app.core.tracking import TrackingExt, tracker
 
 
 async def main():
@@ -34,7 +33,6 @@ async def main():
     logger.info("debug test start")
 
     app_config = get_app_config()
-    from langchain_core.messages import HumanMessage
 
     from app.core.checkpointer import create_checkpointer
 
@@ -57,23 +55,25 @@ async def main():
         agent = GraphAgent(runcontext)
         userquery = "查询北京今天的天气"
         state = {"messages": [HumanMessage(content=userquery)]}
-        thread_id = "debug-thread-42"
+        # 默认每次跑一个全新线程：复用固定 thread_id 会让 checkpointer 里堆积历史消息，
+        # 规划节点看到被污染的上下文（同一问题反复出现）后会给出退化计划。
+        # 需要接着上一次的状态调试时，用 THREAD_ID=xxx 显式指定。
+        thread_id = os.getenv("THREAD_ID") or f"debug-{uuid.uuid4().hex[:8]}"
 
         # 使用成熟的消息打印器
         async for chunk in agent.astream(state, thread_id=thread_id, trace_id=trace_id):
             print("###############最外层输出流######################")
-            if chunk["type"] == "updates" :
+            if chunk["type"] == "updates":
                 data = chunk["data"]
                 if "__interrupt__" in data:
                     for intr in data["__interrupt__"]:
-                        print("中断值:", intr.value)   # 字符串形式的 JSON
+                        print("中断值:", intr.value)  # 字符串形式的 JSON
                         print("中断 ID:", intr.id)
             if chunk["type"] == "custom":
                 print(chunk)
     finally:
         if enter_ctx:
             await enter_ctx.__aexit__(None, None, None)
-
 
 
 if __name__ == "__main__":

@@ -29,11 +29,11 @@ from typing import Any
 
 from app.core.log import logger
 
-__all__ = ["EventType", "StepStatus", "Output", "ToolCallAccumulator", "humanize_tool_call"]
+__all__ = ["EventType", "StepStatus", "Output", "ToolCallAccumulator"]
 
 
-#: 内部机制类型（结构化输出等）：不向前端发事件，避免 dump 上屏
-_INTERNAL_TOOLS = frozenset({"PlanOutput", "ResponseFormat"})
+#: 内部协议工具：不向前端发事件（计划提交走 plan 事件，见 app/agents/plan/protocol.py）
+_INTERNAL_TOOLS = frozenset({"submit_plan"})
 
 
 class EventType(StrEnum):
@@ -188,18 +188,6 @@ class ToolCallAccumulator:
                 args = {"_raw": _summarize(slot["args"], 200)}
             ready.append({"index": idx, "id": slot["id"], "name": slot["name"], "args": args})
         return ready
-
-
-def humanize_tool_call(name: str, args: dict[str, Any] | None = None) -> str:
-    """把工具调用翻译成一句人话（用于阶段提示）。"""
-    args = args or {}
-    match name:
-        case "ask_clarification":
-            return f"需要向你确认：{args.get('question', '')}"
-        case "PlanOutput":
-            return f"规划：{args.get('title', '')}"
-        case _:
-            return f"调用工具 {name}"
 
 
 def _summarize(content: Any, limit: int = 200) -> str:

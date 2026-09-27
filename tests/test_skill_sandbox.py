@@ -29,12 +29,19 @@ class FakeSandbox:
         self._timeout_command = timeout_command
         FakeSandbox.created.append(self)
 
-    def sync_dir(self, local_dir: Any, remote_root: str = "/home/user/skills") -> tuple[str, int]:
+    def _prepare(self, local_dir: Any, skill_id: str = "", remote_root: str = "/home/user/skills") -> tuple[str, int]:
         self.synced.append(str(local_dir))
         from pathlib import Path
 
         files = [p for p in Path(local_dir).rglob("*") if p.is_file() and "__pycache__" not in p.as_posix() and not p.name.endswith(".pyc")]
-        return (f"{remote_root}/{Path(local_dir).name}", len(files))
+        return (f"{remote_root}/{skill_id or Path(local_dir).name}", len(files))
+
+    def sync_dir(self, local_dir: Any, remote_root: str = "/home/user/skills") -> tuple[str, int]:
+        return self._prepare(local_dir, remote_root=remote_root)
+
+    async def aprepare(self, local_dir: Any, skill_id: str = "") -> tuple[str, int]:
+        """统一接口：容器/沙箱就绪 + 技能目录准备（Docker 后端叫 prepare，E2B 后端叫 sync_dir）。"""
+        return self._prepare(local_dir, skill_id)
 
     async def arun_command(self, command: str, *, cwd: str | None = None, timeout: float | None = None) -> ScriptResult:
         self.commands.append((command, cwd))

@@ -1,6 +1,6 @@
 """数据接入层：语雀（Yuque）文档拉取。"""
 
-from app.model.data.yuque.yuque import (
+from app.integrations.yuque.client import (
     YuqueClient,
     YuqueDoc,
     YuqueDocVersion,

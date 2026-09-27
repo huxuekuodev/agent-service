@@ -4,7 +4,7 @@
 
 ## 1. 目标与原则
 
-- **不改变现有执行环**：summarization → plan(澄清/规划/审查) → dispatch(DAG+Send fan-out) → general_agent → … → plan(审查) 的闭环原样保留；
+- **不改变现有执行环**：plan(澄清/规划/审查) → dispatch(DAG+Send fan-out) → general_agent → … → plan(审查) 的闭环原样保留；
 - skill 只解决两件事：**让规划节点知道"有哪些标准做法"**（拆得更准），**让失败有标准恢复路径**（含人工介入清理）；
 - 现状中可直接复用的点：`app/agents/tools/registry`（工具注入）、`describe_execute_tools_v2`（能力描述进规划提示词）、`ask_clarification` 链路（澄清/中断）、打点监控（skill 使用率/失败率）、Postgres checkpointer（interrupt 恢复的基础）、`plan_tasks` merge reducer（update 追加恢复任务）。
 
@@ -92,7 +92,7 @@ except Exception as exc:
 
 - SubTask 扩展字段：`skill_id / error_code`（技能整体执行，**没有** sop_step）；
 - ThreadState 扩展 `artifacts`（产物登记表）与 `skill_contexts`；
-- 错误分类复用 `app/agents/errors.py` 的 classify + skill 自定义错误码。
+- 错误分类复用 `app/agents/common/errors.py` 的 classify + skill 自定义错误码。
 
 ### 4.4 审查分支：失败 → skill errors.yaml 驱动恢复
 现有路由：全部任务终态 → 回 `plan_model_node`（review）。扩展 review 提示词：
@@ -191,11 +191,13 @@ class SubTask(BaseModel):
 - **框架包 `app/agents/skills/`**：models（SkillMeta/SkillFile/ErrorRule/CleanupRule/SkillContext）、
   registry（扫描 + frontmatter + 工具依赖校验 + `<SkillsIndex>` 导出）、
   loader（整份 SKILL.md + 文件清单 + errors/cleanup 解析，结构化数据一律 YAML）、
-  sandbox（E2B：传目录 / 跑命令 / 销毁）、session（沙箱会话：按 skill 复用 + TTL 回收 + 并发串行）、tools。
-- **E2B 沙箱（会话化）** 与 **技能工具链注入执行 agent**（list_skills / load_skill / sandbox_create /
+  sandbox（E2B 后端）、docker_sandbox（**Docker 后端，默认**）、factory（按 backend 选后端）、
+  session（沙箱会话：按 skill 复用 + TTL 回收 + 并发串行 + 任务结束即回收）、tools。
+- **沙箱（Docker 默认 / E2B 可回退）** 与 **技能工具链注入执行 agent**（list_skills / load_skill / sandbox_create /
   sandbox_run / sandbox_close / sandbox_list / query_error 自动追加进 `get_execute_tools()`）：
   技能脚本 → 沙箱内执行，注册工具 → 本地执行。
-- **配置**：`skills:` 段（dir/cleanup_default/max_candidates/sandbox）；可选依赖 `sandbox = [e2b-code-interpreter]`。
+- **配置**：`skills:` 段（dir/cleanup_default/max_candidates/sandbox）；依赖 `docker + paramiko`（默认后端），
+  可选回退依赖 `sandbox-e2b = [e2b-code-interpreter]`。
 - **P0 代码接线（本轮）**：
   - `SubTask` 增加 `skill_id / error_code`（一个技能一个任务）；
   - `plan_model_node`：能力描述末尾拼接 `<SkillsIndex>`（registry.skill_index_text，带工具可用性标注，
@@ -237,3 +239,69 @@ class SubTask(BaseModel):
 - P1 人工介入：`langgraph.interrupt()` 清理确认（产物清单 + 全部删除/保留）+ `POST /sessions/{id}/resume`
   + 前端确认卡片 + cleanup 决策打点审计。
 - skill 使用打点（page=skill）+ 监控页 skill 面板（P2 候选匹配升级）。
+
+
+## 11. 沙箱后端：Docker（默认）替换 E2B
+
+目标：**省钱、可控**。技能脚本改在**一次性 Docker 容器**里执行（`skills.sandbox.backend=docker`），
+镜像直接用宿主机已有的 `python:3.11`，不再按调用量付云端沙箱费用。
+
+### 11.1 四条硬性要求与实现
+
+| 要求 | 实现 |
+|------|------|
+| 一次性容器 | **每次技能任务新建容器**，任务结束由**框架**回收（`general_agent` 任务收尾调用 `sandbox_close`），空闲 TTL 兜底 |
+| 技能上传到宿主机 tmp | 目录 `<host_tmp_dir>/<YYYY-MM-DD>/<skill_id>/`（默认 `/tmp/deer-skills`）；**当天已有该技能就直接复用、不重传**（实测第二次 prepare 上传 0 个文件）；跨天重新上传，技能改动当天生效 |
+| 容器根文件系统只读 | `read_only=True` + `tmpfs={"/tmp": "rw,size=64m,exec"}`；技能目录以 **ro** 挂到 `/workspace/<skill_id>`（实测 `touch` 报 Read-only file system） |
+| 技能网络 | `network_mode=host`（默认，依赖宿主机网络），容器内 `urlopen('http://example.com')` 实测 200 |
+| 超时保护 | 单条命令超时（`command_timeout`，默认 **5s**）即 **kill 并删除容器**，返回可执行提示 |
+
+另有资源上限：`mem_limit=256m`、`pids_limit=128`、`cap_drop=["ALL"]`、`no-new-privileges`。
+
+### 11.2 两个实测出来的关键坑（务必保留当前写法）
+
+1. **必须用 paramiko 传输**：`DockerClient(base_url="ssh://…", use_ssh_client=False)`。
+   `use_ssh_client=True`（走 ssh CLI 二进制）时 `exec_run` / `put_archive` 会**挂死**（实测 5 分钟无响应）；
+   改用 paramiko 传输后 exec 0.6s 返回。
+2. **不能 `exec_start(detach=True)`**：docker 会丢弃 detached exec 的输出（表现为"命令成功但没有任何输出"）。
+   当前实现是**阻塞读取 + 线程内超时**：到点 `container.kill()`，容器一死 exec 随之结束。
+   另外 docker exec 把 stdout/stderr 合并成一条流，因此按退出码把它整体放到 `stderr` 回传给 LLM（避免丢失败原因）。
+
+### 11.3 文件上传路径
+
+技能文件在**应用机**上，容器挂载的是**Docker 宿主机**的目录，两者可能不是同一台机器。
+上传实现：借一个临时容器把宿主机目录 bind 到 `/mnt`，先 `exec_run` 判存在/建目录，再 `put_archive` 写入
+（只依赖 Docker API，不需要在应用机配 scp/rsync）。写入后 `find | wc -l` 校验非空。
+
+### 11.4 配置（config.yaml `skills.sandbox`）
+
+```yaml
+skills:
+  sandbox:
+    backend: docker                 # docker（默认）| e2b（可选回退）
+    docker_url: $DOCKER_HOST_URL     # ssh://user@host:22 或 unix:///var/run/docker.sock（.env 注入）
+    docker_image: python:3.11        # 需已存在于目标 Docker 主机
+    docker_network_mode: host
+    host_tmp_dir: /tmp/deer-skills   # 宿主机技能目录根（按天分目录）
+    command_timeout: 5               # 单条命令超时即 kill 容器
+    mem_limit: 256m
+    pids_limit: 128
+    tmpfs_size: 64m
+    keep_host_files_days: 2          # 宿主技能目录保留天数
+```
+
+依赖：`docker>=7.1` + `paramiko>=3.4`（`uv sync` 安装）。回退到 E2B：把 `backend` 改成 `e2b` 并安装
+`uv sync --extra sandbox-e2b`、配置 `E2B_API_KEY`/`E2B_TEMPLATE`。
+
+### 11.5 实测数据（2026-09，远端 Docker 29.5）
+
+```
+prepare 首次：上传 9 个文件 / 500KB（约 1.2s）→ 宿主机 /tmp/deer-skills/<date>/query-weather
+prepare 二次：复用缓存，上传 0 个文件（约 0.9s）
+技能脚本执行：exit=0，输出正常（python:3.11 + 只读挂载）
+根文件系统：touch 失败（Read-only file system）
+网络：NET 200
+超时保护：>5s 的 sleep 被 kill，容器进入 exited 并删除
+端到端（真实天气技能）：图内 2 条命令执行成功，得到「2026-09-26 雷阵雨 17~27℃ 东南风 1-3级」，
+                        任务结束框架自动回收容器 → 结束后沙箱容器数 0
+```

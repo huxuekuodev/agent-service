@@ -47,6 +47,13 @@ CREATE TABLE IF NOT EXISTS evaluations (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 COMMENT ON TABLE evaluations IS '评估结果明细（带版本与对象身份，支持按维度切片与前后对比）';
+
+-- 一次用户回合 = 一条评估链（规划完成 / 每个任务完成 / 最终回复 三次触发共享同一 run_id）
+ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS run_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS trigger TEXT NOT NULL DEFAULT '';
+COMMENT ON COLUMN evaluations.run_id IS '评估链 id（一次用户回合内所有触发点共享，便于看完整链条）';
+COMMENT ON COLUMN evaluations.trigger IS '触发点：plan_done / task_done / final_answer';
+CREATE INDEX IF NOT EXISTS idx_evaluations_run ON evaluations (run_id, trigger);
 CREATE INDEX IF NOT EXISTS idx_evaluations_created ON evaluations (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_evaluations_session ON evaluations (session_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_evaluations_metric ON evaluations (evaluator, metric, created_at DESC);
@@ -414,6 +421,11 @@ CREATE TRIGGER trg_monitor_components_updated_at BEFORE UPDATE ON monitor_compon
 INSERT INTO schema_migrations (version, note)
 VALUES ('20260912_001_business_schema',
         'users/user_identities/user_tokens/sessions/messages(partitioned)/message_idempotency/session_events/monitor_*')
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO schema_migrations (version, note)
+VALUES ('20260913_003_eval_chain',
+        'evaluations 增加 run_id / trigger：一次用户回合的评估链（规划/任务/最终回复）')
 ON CONFLICT (version) DO NOTHING;
 
 INSERT INTO schema_migrations (version, note)

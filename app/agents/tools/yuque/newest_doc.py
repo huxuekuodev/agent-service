@@ -6,7 +6,7 @@
 与其前一个历史版本（前天，或更早的某一天——只要小于目标日期即可），
 返回两者完整内容，供 agent 对比「昨天改了什么」。
 
-依赖 app.model.data.yuque.YuqueClient（语雀 Open API v2）：
+依赖 app.integrations.yuque.YuqueClient（语雀 Open API v2）：
   - GET /doc_versions?doc_id={id}   历史版本列表（按时间倒序）
   - GET /doc_versions/{id}          版本详情（含正文 body_md / diff）
 
@@ -24,7 +24,7 @@ from typing import Any
 
 from langchain.tools import BaseTool, tool
 
-from app.model.data.yuque import YuqueClient, YuqueDocVersion, YuqueDocVersionDetail
+from app.integrations.yuque import YuqueClient, YuqueDocVersion, YuqueDocVersionDetail
 
 
 def _to_local_date(iso: str) -> date | None:

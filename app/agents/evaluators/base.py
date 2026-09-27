@@ -197,6 +197,19 @@ class BaseEvaluator:
         """规则校验优先。返回非 None 时，该指标直接用此结果（不再走 LLM）。"""
         return None
 
+    def _filter_known_metrics(self, data: Any) -> Any:
+        """只保留"已配置的指标名"（judge 常把 schema 里的 enabled/pass_score 等字段一起回传）。
+
+        否则这些结构字段会被当成指标记录，污染评估数据（实测出现过 GeneralEvaluator/enabled）。
+        """
+        if not isinstance(data, dict):
+            return data
+        known = set(self.get_metrics())
+        unknown = [k for k in data if k not in known and k not in ("rationale", "reason", "comment")]
+        if unknown:
+            logger.debug("忽略 judge 返回的非指标字段: %s", unknown)
+        return {k: v for k, v in data.items() if k in known or k in ("rationale", "reason", "comment")}
+
     def parse_llm_response(self, data: dict) -> dict[str, float]:
         """从 LLM 输出 dict 中解析指标得分。子类可覆盖（处理额外键等）。"""
         scores: dict[str, float] = {}
@@ -268,7 +281,7 @@ class BaseEvaluator:
             result.passed = True
 
         self._emit_langfuse(trace_id=trace_id, prompt_input=prompt_input, result=result)
-        return result
+        return self._filter_known_metrics(result)
 
     # ------------------------------------------------------------------
     # LLM judge

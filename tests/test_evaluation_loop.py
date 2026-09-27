@@ -6,12 +6,11 @@ import asyncio
 
 import pytest
 
-from app.agents.evaluation.general_evaluator import GeneralEvaluator, _has_tool_activity
-from app.evaluation import current_meta, record_evaluation, register_sink, update_meta
+from app.agents.evaluators.general_evaluator import GeneralEvaluator, _has_tool_activity
+from app.evaluation import begin_run, current_meta, decide_trigger, new_run_id, record_evaluation, register_sink, update_meta
 from app.evaluation.context import RunMeta
-from app.evaluation.policy import decide
 
-# --------------------------------------------------------------------------- 策略判定
+# --------------------------------------------------------------------------- 触发点判定
 
 
 @pytest.fixture(autouse=True)
@@ -20,57 +19,47 @@ def _policy(monkeypatch: pytest.MonkeyPatch):
     from app.config import get_app_config
 
     policy = get_app_config().evaluation_policy
-    monkeypatch.setattr(policy, "mode", "worth_it", raising=False)
+    monkeypatch.setattr(policy, "mode", "always", raising=False)
     monkeypatch.setattr(policy, "baseline_sample_rate", 0.0, raising=False)
+    monkeypatch.setattr(policy, "triggers", {"plan_done": True, "task_done": True, "final_answer": True}, raising=False)
+    monkeypatch.setattr(policy, "thresholds", {}, raising=False)
     return policy
 
 
-def test_worth_it_signals_trigger_evaluation() -> None:
-    for signals in (
-        {"replan": True},
-        {"failed_task": True},
-        {"clarify": True},
-        {"first_turn": True},
-        {"user_follow_up": True},
-        {"task_count": 3},
-        {"skill_used": True},
-    ):
-        decision = decide(signals=signals)
-        assert decision.should, f"信号未触发评估: {signals}"
-        assert decision.signals
+def test_worth_signals_detected(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.evaluation.policy import worth_signals
+
+    assert worth_signals({"replan": True}) == ["replan"]
+    assert worth_signals({"task_count": 3}) == ["many_tasks"]
+    assert worth_signals({"task_count": 1}) == []
 
 
-def test_ordinary_turn_is_skipped_by_default() -> None:
-    decision = decide(signals={"task_count": 1})
-    assert decision.should is False
-    assert "普通轮次" in decision.reason
-
-
-def test_mode_always_and_off(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_worth_it_mode_skips_ordinary_turn_then_allows_signalled_one(monkeypatch: pytest.MonkeyPatch) -> None:
     from app.config import get_app_config
 
-    policy = get_app_config().evaluation_policy
-    monkeypatch.setattr(policy, "mode", "always", raising=False)
-    assert decide(signals={}).should is True
+    monkeypatch.setattr(get_app_config().evaluation_policy, "mode", "worth_it", raising=False)
+    begin_run()
+    assert decide_trigger("plan_done").should is False  # 无信号 → 普通轮次
+    update_meta(signals={"clarify": True})
+    assert decide_trigger("plan_done").should is True  # 命中信号 → 评
 
-    monkeypatch.setattr(policy, "mode", "off", raising=False)
-    assert decide(signals={"clarify": True}).should is False
 
-
-def test_evaluator_sample_rate_applies_after_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mode_off_blocks_every_trigger(monkeypatch: pytest.MonkeyPatch) -> None:
     from app.config import get_app_config
 
-    monkeypatch.setattr(get_app_config().evaluation_policy, "mode", "always", raising=False)
-    assert decide(signals={}, sample_rate=0.0).should is False  # 采样率 0 → 不评
+    monkeypatch.setattr(get_app_config().evaluation_policy, "mode", "off", raising=False)
+    begin_run()
+    for trigger in ("plan_done", "task_done", "final_answer"):
+        assert decide_trigger(trigger).should is False
 
 
-def test_baseline_sampling_can_let_ordinary_turns_through(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_chain_level_sampling_can_disable_run(monkeypatch: pytest.MonkeyPatch) -> None:
     from app.config import get_app_config
 
-    monkeypatch.setattr(get_app_config().evaluation_policy, "baseline_sample_rate", 1.0, raising=False)
-    decision = decide(signals={})
-    assert decision.should is True
-    assert "抽样" in decision.reason
+    monkeypatch.setattr(get_app_config().evaluation_policy, "thresholds", {"sample_rate": 0.0}, raising=False)
+    decision = begin_run()
+    assert decision.enabled is False
+    assert decide_trigger("plan_done").should is False
 
 
 # --------------------------------------------------------------------------- 身份
@@ -176,3 +165,73 @@ def test_path_efficiency_requires_tool_activity() -> None:
 def test_has_tool_activity_tolerates_bad_shapes() -> None:
     assert _has_tool_activity([None, "x", {"type": ""}]) is False
     assert _has_tool_activity([{"type": "tool"}]) is True
+
+
+# --------------------------------------------------------------------------- 三个触发点与评估链
+
+
+def test_begin_run_opens_chain_and_marks_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """调用 agent 那一层开链：run_id + eval_enabled + 触发点开关都写进 RunMeta。"""
+    from app.config import get_app_config
+
+    monkeypatch.setattr(get_app_config().evaluation_policy, "mode", "always", raising=False)
+    decision = begin_run()
+    meta = current_meta()
+    assert decision.enabled is True
+    assert meta.run_id == decision.run_id and len(meta.run_id) == 16
+    assert meta.triggers == {"plan_done": True, "task_done": True, "final_answer": True}
+
+
+def test_begin_run_reuses_given_run_id() -> None:
+    """resume 复用链 id：同一用户回合的三个触发点属于同一条链。"""
+    decision = begin_run(run_id="fixed-run-id")
+    assert decision.run_id == "fixed-run-id"
+    assert current_meta().run_id == "fixed-run-id"
+
+
+def test_decide_trigger_respects_switches_and_thresholds(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.config import get_app_config
+
+    policy = get_app_config().evaluation_policy
+    monkeypatch.setattr(policy, "mode", "always", raising=False)
+    monkeypatch.setattr(policy, "triggers", {"plan_done": True, "task_done": False, "final_answer": True}, raising=False)
+    begin_run()
+    assert decide_trigger("plan_done").should is True
+    assert decide_trigger("task_done").should is False  # 触发点关闭
+
+    monkeypatch.setattr(policy, "triggers", {"plan_done": True, "task_done": True, "final_answer": True}, raising=False)
+    monkeypatch.setattr(policy, "thresholds", {"min_task_count": 3}, raising=False)
+    begin_run()
+    assert decide_trigger("task_done", task_count=2).should is False  # 未达任务数阈值
+    assert decide_trigger("task_done", task_count=3).should is True
+
+
+def test_decide_trigger_blocked_when_run_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.config import get_app_config
+
+    monkeypatch.setattr(get_app_config().evaluation_policy, "mode", "off", raising=False)
+    begin_run()
+    for trigger in ("plan_done", "task_done", "final_answer"):
+        assert decide_trigger(trigger).should is False
+
+
+def test_new_run_id_is_unique() -> None:
+    assert new_run_id() != new_run_id()
+
+
+def test_parse_llm_response_filters_unknown_metric_keys() -> None:
+    """judge 常把 schema 里的 enabled/pass_score 一起回传，不能被当成指标（实测出现过）。"""
+    from app.agents.evaluators.final_answer_evaluator import FinalAnswerEvaluator
+
+    evaluator = FinalAnswerEvaluator()
+    scores = evaluator.parse_llm_response({"question_fit": 4, "groundedness": 5, "completeness": 3, "enabled": True, "pass_score": 3.0})
+    assert set(scores) == {"question_fit", "groundedness", "completeness"}
+    assert scores["question_fit"] == 4.0
+
+
+def test_final_answer_metrics_not_applicable_without_answer() -> None:
+    from app.agents.evaluators.final_answer_evaluator import FinalAnswerEvaluator
+
+    evaluator = FinalAnswerEvaluator()
+    assert evaluator.is_metric_applicable("question_fit", {"final_answer": "(空)"}) is False
+    assert evaluator.is_metric_applicable("question_fit", {"final_answer": "有答复"}) is True

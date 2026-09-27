@@ -3,7 +3,7 @@
 
 对 general_agent 单次任务执行的「过程」做评估（不评估任务结果正确性，
 那是执行 agent 自己的职责），基于 BaseEvaluator 抽象，通过 config.yaml
-的 ``evaluators`` 列表注册（use: app.agents.evaluation.general_evaluator:GeneralEvaluator）。
+的 ``evaluators`` 列表注册（use: app.agents.evaluators.general_evaluator:GeneralEvaluator）。
 
 评估指标（默认，1-5 分，通过线 3.0）：
   1. path_efficiency（路径效率）：
@@ -21,7 +21,7 @@ Prompt 来源（唯一来源，不在代码中写死）：
     evaluators:
       - name: general_evaluation
         display_name: "执行评估"
-        use: app.agents.evaluation.general_evaluator:GeneralEvaluator
+        use: app.agents.evaluators.general_evaluator:GeneralEvaluator
         model: evaluate_model
         enabled: true
         sample_rate: 1.0
@@ -43,7 +43,7 @@ import json
 import logging
 from typing import Any
 
-from app.agents.evaluation.base import BaseEvaluator, MetricConfig
+from app.agents.evaluators.base import BaseEvaluator, MetricConfig
 
 logger = logging.getLogger(__name__)
 
@@ -319,8 +319,43 @@ async def maybe_evaluate_general(
     与 ``plan_evaluator.maybe_evaluate_plan`` 保持一致的触发模式，但更轻量：
     直接从 config 读 ``general_evaluation`` 评估器设置，未配置则跳过（不引入旧配置兼容分支）。
     """
+    # 判定点统一在调用层；通过后整条评估放后台（不占执行节点的时间）
+    from app.evaluation import decide_trigger as _decide_trigger
+    from app.evaluation.recorder import submit_background as _submit_background
+
+    _decision = _decide_trigger("task_done")
+    if not _decision.should:
+        logger.debug("[evaluation] 跳过任务评估: %s", _decision.reason)
+        return
+    _submit_background(
+        _evaluate_general_and_record(
+            trace_id=trace_id,
+            task_info=task_info,
+            messages=messages,
+            tools_desc=tools_desc,
+            current_time=current_time,
+            config=config,
+            runtime=runtime,
+            decision_reason=_decision.reason,
+        ),
+        what="task_done",
+    )
+
+
+async def _evaluate_general_and_record(
+    *,
+    trace_id: str,
+    task_info: str,
+    messages: list[Any],
+    tools_desc: str,
+    current_time: str,
+    config: Any,
+    runtime: Any,
+    decision_reason: str = "",
+) -> None:
+    """真正的执行评估（后台执行）。"""
     try:
-        from app.agents.evaluation.registry import create_evaluator
+        from app.agents.evaluators.registry import create_evaluator
         from app.llm import create_llm_with_name
 
         context = runtime.context
@@ -347,20 +382,11 @@ async def maybe_evaluate_general(
         if evaluator is None:
             return
 
-        from app.evaluation import current_meta as _current_meta
-        from app.evaluation import decide as _decide
+        from app.evaluation import decide_trigger as _decide_trigger
 
-        _decision = _decide(signals=_current_meta().signals, sample_rate=eval_settings.sample_rate)
+        _decision = _decide_trigger("task_done")
         if not _decision.should:
-            logger.debug("[evaluation] 跳过执行评估: %s", _decision.reason)
-            return
-
-        from app.evaluation import current_meta as _current_meta
-        from app.evaluation import decide as _decide
-
-        _decision = _decide(signals=_current_meta().signals, sample_rate=eval_settings.sample_rate)
-        if not _decision.should:
-            logger.debug("[evaluation] 跳过执行评估: %s", _decision.reason)
+            logger.debug("[evaluation] 跳过任务评估: %s", _decision.reason)
             return
 
         eval_input = GeneralEvaluationInput(
@@ -384,6 +410,7 @@ async def maybe_evaluate_general(
             await record_evaluation(
                 evaluator="GeneralEvaluator",
                 node="general_agent",
+                trigger="task_done",
                 metric_scores=result.scores,
                 rationales=result.rationales,
                 passed=result.passed,
@@ -391,7 +418,7 @@ async def maybe_evaluate_general(
                 trace_id=trace_id,
                 prompt_input=_prompt_input,
                 output_payload={"task_info": task_info, "history_tail": (eval_input.history or [])[-5:]},
-                extra_meta={"policy_reason": _decision.reason, "policy_signals": _decision.signals},
+                extra_meta={"policy_reason": decision_reason},
             )
     except Exception as exc:
         logger.warning("General evaluation skipped: %s", exc)

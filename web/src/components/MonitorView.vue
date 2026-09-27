@@ -247,6 +247,7 @@ const evalMetric = ref('')
 const evalRows = ref([])
 const evalCases = ref([])
 const evalFeedback = ref([])
+const evalRuns = ref([])
 const evalError = ref('')
 
 const EVAL_DIMENSIONS = [
@@ -278,6 +279,14 @@ async function loadEvalCases() {
   }
 }
 
+async function loadEvalRuns() {
+  try {
+    evalRuns.value = await monitorEvalRuns(10)
+  } catch (e) {
+    console.warn('加载评估链失败:', e)
+  }
+}
+
 async function loadEvalFeedback() {
   try {
     evalFeedback.value = await monitorEvalFeedback(10)
@@ -291,6 +300,7 @@ function refreshAll() {
   loadTokenUsage()
   loadEvalSummary()
   loadEvalCases()
+  loadEvalRuns()
   loadEvalFeedback()
 }
 
@@ -302,6 +312,7 @@ loadComponents()
 loadTokenUsage()
 loadEvalSummary()
 loadEvalCases()
+loadEvalRuns()
 loadEvalFeedback()
 </script>
 
@@ -434,6 +445,22 @@ loadEvalFeedback()
         </tbody>
       </table>
       <p v-else class="muted">暂无评估数据（评估按策略触发：replan / 失败 / 澄清 / 首轮 / 追问 / 多任务 / 用技能）。</p>
+
+      <h4 class="sub">🔗 评估链（一次回合触发了哪些评估点）</h4>
+      <table v-if="evalRuns.length">
+        <thead><tr><th>链 id</th><th>条数</th><th>触发点数</th><th>触发点</th><th>均分</th><th>开始时间</th></tr></thead>
+        <tbody>
+          <tr v-for="r in evalRuns" :key="r.run_id">
+            <td class="mono">{{ String(r.run_id).slice(0, 8) }}</td>
+            <td>{{ r.rows }}</td>
+            <td>{{ r.triggers }}</td>
+            <td>{{ (r.trigger_list || []).join(' / ') }}</td>
+            <td>{{ r.avg_score }}</td>
+            <td>{{ r.started_at }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-else class="muted">暂无评估链数据。</p>
 
       <h4 class="sub">🚩 低分案例（可直接拿去改 prompt / 技能）</h4>
       <div v-for="c in evalCases" :key="c.id" class="case">

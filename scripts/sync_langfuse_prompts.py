@@ -51,6 +51,7 @@ SPECS: tuple[PromptSpec, ...] = (
     PromptSpec("general", "general_agent_system_prompt.md", "general_agent_system_prompt", "执行节点 general_agent（当前回退本地文件）"),
     PromptSpec("plan_eval", "plan_evaluator_prompt.md", "plan_evaluator_prompt", "规划评估器 PlanEvaluator"),
     PromptSpec("general_eval", "general_evaluator_prompt.md", "general_evaluator_prompt", "执行评估器 GeneralEvaluator"),
+    PromptSpec("final_eval", "final_answer_evaluator_prompt.md", "final_answer_evaluator_prompt", "最终回复评估器 FinalAnswerEvaluator"),
 )
 
 

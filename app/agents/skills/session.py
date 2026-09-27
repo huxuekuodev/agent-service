@@ -28,8 +28,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from app.agents.skills.factory import create_skill_sandbox
 from app.agents.skills.loader import load_skill_context_by_id
-from app.agents.skills.sandbox import ScriptResult, SkillSandbox, SkillSandboxError, sandbox_available
+from app.agents.skills.sandbox import ScriptResult, SkillSandboxError, sandbox_available
 from app.core.log import logger
 
 __all__ = ["SandboxSession", "SandboxSessionManager", "get_session_manager", "aclose_all_sessions"]
@@ -72,7 +73,7 @@ class SandboxSessionManager:
 
     Args:
         sandbox_factory: 构造底层沙箱的工厂（测试可注入假实现）；
-            默认 ``SkillSandbox.acreate``（E2B 真实沙箱）。
+            默认 ``create_skill_sandbox``（按 ``skills.sandbox.backend`` 选 Docker / E2B）。
         ttl_seconds: 空闲回收秒数；``None`` 时读 config（``skills.sandbox.session_ttl_seconds``）。
         max_sessions: 同时存活上限；``None`` 时读 config（``skills.sandbox.max_sessions``）。
     """
@@ -84,7 +85,7 @@ class SandboxSessionManager:
         ttl_seconds: int | None = None,
         max_sessions: int | None = None,
     ) -> None:
-        self._factory = sandbox_factory or SkillSandbox.acreate
+        self._factory = sandbox_factory or create_skill_sandbox
         self._sessions: dict[str, SandboxSession] = {}
         self._guard = asyncio.Lock()
         self._ttl_override = ttl_seconds
@@ -139,7 +140,7 @@ class SandboxSessionManager:
 
             ok, reason = sandbox_available()
             if not ok:
-                raise SkillSandboxError(f"沙箱不可用：{reason}。请先完成沙箱配置（skills.sandbox / E2B_* 环境变量）再重试。")
+                raise SkillSandboxError(f"沙箱不可用：{reason}。请先完成沙箱配置（skills.sandbox + .env 的 DOCKER_HOST_URL；e2b 后端另有 E2B_*）再重试。")
 
             ctx = await load_skill_context_by_id(skill_id)
             if ctx is None:
@@ -152,10 +153,17 @@ class SandboxSessionManager:
             return session
 
     async def _create_session(self, skill_dir: Path, skill_id: str) -> SandboxSession:
-        """建沙箱 + 同步技能目录（不注册到表里，便于失败时直接销毁）。"""
+        """建沙箱并准备技能目录（宿主机已有则跳过上传；不注册到表里，便于失败时直接销毁）。
+
+        Docker 后端传 ``skill_id`` 以便按天缓存目录；E2B 后端忽略该参数。
+        """
         sandbox = await self._factory()
         try:
-            remote_dir, uploaded = await asyncio.to_thread(sandbox.sync_dir, skill_dir)
+            if hasattr(sandbox, "aprepare"):
+                remote_dir, uploaded = await sandbox.aprepare(skill_dir, skill_id)
+            else:  # 兼容只实现 async_sync_dir 的后端
+                remote_dir = await sandbox.async_sync_dir(skill_dir)
+                uploaded = 0
         except Exception:
             await _safe_close(sandbox)
             raise

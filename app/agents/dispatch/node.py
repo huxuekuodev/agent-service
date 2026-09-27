@@ -13,7 +13,10 @@ Step Dispatch Node + Fan-out Router：筛选可执行任务，标记 in_progress
   - 只在**确实有可执行任务**时中断（否则每次回到本节点都会多问一次，用户会莫名其妙）；
   - 确认卡片只展示**面向用户的任务**，系统内部任务（``skill_probe`` 等）不展示、也不需要批准；
   - 用户可以不选任何选项直接继续，也可以只留一句意见——有意见则回到规划节点重排计划
-    （协议见 ``app/agents/interrupts.py``，与 ``approval.plan_review`` 开关联动）。
+    （协议见 ``app/agents/common/interrupts.py``，与 ``approval.plan_review`` 开关联动）。
+
+就绪判定与系统内部任务标识来自 ``app/agents/plan/dag.py``：规划节点与派发节点共用同一份
+DAG 语义，避免"规划怎么写、派发怎么读"两套规则。
 """
 
 from typing import Any
@@ -23,12 +26,10 @@ from langgraph.constants import Send
 from langgraph.graph import END
 from langgraph.types import Command, interrupt
 
-from app.agents.interrupts import DEFAULT_QUESTION_ID, build_ask, parse_answer
-from app.agents.subtask import SubTask
-from app.agents.thread_state import ThreadState
-
-#: 系统内部任务（校验/探测类）：不展示给用户、不需要用户批准
-INTERNAL_TASK_IDS = frozenset({"skill_probe"})
+from app.agents.common.interrupts import DEFAULT_QUESTION_ID, build_ask, parse_answer
+from app.agents.plan.dag import INTERNAL_TASK_IDS, pick_ready
+from app.agents.state.subtask import SubTask
+from app.agents.state.thread_state import ThreadState
 
 
 def _inject_dep_results(task: SubTask, plan_tasks: list[SubTask]) -> str:
@@ -59,25 +60,8 @@ async def step_dispatch_node(state: ThreadState, **kwargs) -> dict:
     if not plan_tasks:
         return {}
 
-    status_map = {t.plan_id: t.step_statuses for t in plan_tasks}
     status_updates: list[SubTask] = []
-    runnable: list[SubTask] = []
-
-    for task in plan_tasks:
-        if task.step_statuses != "not_started":
-            continue
-
-        # 检查依赖
-        deps_ready = True
-        for dep_id in task.deps or []:
-            dep_status = status_map.get(dep_id)
-            if dep_status != "completed":
-                task.blocked_message = f"等待依赖任务 [{dep_id}] 完成"
-                deps_ready = False
-                break
-
-        if deps_ready:
-            runnable.append(task)
+    runnable = pick_ready(plan_tasks)
 
     # 执行前确认：只在本轮确实要派发任务时问一次；无意见即继续，有意见回规划节点重排
     approval_message = _request_plan_approval(runnable)

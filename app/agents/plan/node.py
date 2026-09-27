@@ -1,45 +1,47 @@
-"""
-规划节点（合并澄清 + 规划 + 审查）。
+"""规划节点：澄清 → 规划 → 审查（一个节点内完成，产出经过校验的 SubTask DAG）。
 
-职责：
-  1. 澄清：分析用户输入，模糊或缺失信息时调用 ask_clarification
-  2. 规划：需求明确后拆解为 SubTask DAG（模型直接输出计划 JSON）
-  3. 审查：执行后审查结果，决定完成或 replan
+职责（业务契约见 ``schema.py``，DAG 操作见 ``dag.py``，提交协议见 ``protocol.py``）：
 
-设计说明：
-  - 不再使用 create_plan / update_plan 工具（绕了三层间接：工具→bridge→哨兵/reducer）
-  - 模型通过结构化输出直接产出计划（PlanOutput），plan_model_node 解析为 SubTask
-  - 新计划（用户新需求）→ 用 Overwrite 整体替换旧计划（绕过 merge reducer）
-  - 状态更新（执行节点回写）→ 继续用 merge reducer 合并
-  - 仅保留 ask_clarification 工具（经 get_plan_tools 注入）
+1. **澄清**：问题不清晰 → 模型调 ``ask_clarification``，把问题呈现给用户；
+2. **规划**：清晰 → 模型调 ``submit_plan`` 提交任务 DAG（技能任务在任务上标注 ``skill_id``）；
+3. **审查**：任务执行完后回看 ``<PlanStatus>``，够回答就 ``action='complete'`` 直接给答案，
+   不够就 ``action='update'`` 增补任务。
+
+计划从模型到状态只走一条路：``submit_plan`` 的工具参数 → pydantic 校验（schema.py）
+→ DAG 拓扑校验/修复（dag.py）→ ``plan_tasks`` 状态。没有"结构化输出三路兼容"这类分支。
 """
 
-import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
 from langchain.agents import create_agent
-from langchain_core.messages import (AIMessage, BaseMessage, HumanMessage,
-                                     ToolMessage)
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
-from langfuse import Langfuse
 from langgraph.runtime import Runtime
 from langgraph.types import Command, Overwrite
-from pydantic import BaseModel, Field
 
-from app.agents.errors import build_error_fallback_message, classify_llm_error
-from app.agents.evaluation.plan_evaluator import (EvaluationInput,
-                                                  maybe_evaluate_plan)
-from app.agents.events import Output, ToolCallAccumulator
-from app.agents.lead_agent import GraphContext
-from app.agents.middlewares.clarification_middleware import \
-    ClarificationMiddleware
-from app.agents.middlewares.dangling_tool_call_middleware import \
-    DanglingToolCallMiddleware
-from app.agents.subtask import SubTask
-from app.agents.thread_state import ThreadState
-from app.agents.tools import describe_execute_tools, get_plan_tools
-from app.agents.utils.current_time import has_current_time_for_today
+from app.agents.common.current_time import has_current_time_for_today
+from app.agents.common.errors import build_error_fallback_message, classify_llm_error
+from app.agents.common.events import Output, ToolCallAccumulator
+from app.agents.evaluators.plan_evaluator import EvaluationInput, maybe_evaluate_plan
+from app.agents.graph import GraphContext
+from app.agents.middlewares.clarification_middleware import ClarificationMiddleware
+from app.agents.middlewares.dangling_tool_call_middleware import DanglingToolCallMiddleware
+from app.agents.plan.dag import (
+    INTERNAL_TASK_IDS,
+    inject_skill_probe,
+    render_plan_status,
+    repair_topology,
+    skill_ids_of,
+    to_subtask,
+    validate_topology,
+)
+from app.agents.plan.prompt import build_capability_desc, build_system_prompt
+from app.agents.plan.protocol import SUBMIT_TOOL_NAME, PlanSubmissionMiddleware, parse_submission, submit_plan
+from app.agents.plan.schema import SKILL_PROBE_ID, PlanOutput
+from app.agents.state.subtask import SubTask
+from app.agents.state.thread_state import ThreadState
+from app.agents.tools import get_plan_tools
 from app.core.context import trace_id_ctx_var
 from app.core.log import logger
 from app.core.tracking import TrackingPage, TrackingType
@@ -47,133 +49,9 @@ from app.core.tracking.tracker import track
 from app.llm import create_llm_with_name
 
 
-class PlanTask(BaseModel):
-    """计划中的单个子任务（模型结构化输出）。"""
-
-    plan_id: str = Field(description="子任务唯一标识，如 task1 / task2")
-    name: str = Field(description="子任务名称（简短）")
-    desc: str = Field(description="子任务详细描述。可用 {其他任务plan_id} 引用依赖任务的结果")
-    execution_agent: str = Field(default="general_agent", description="执行此任务的 agent")
-    sort: int = Field(default=0, description="执行顺序序号")
-    deps: list[str] = Field(default_factory=list, description="依赖的子任务 plan_id 列表")
-    skill_id: str = Field(default="", description="该任务执行的技能 id（一个技能=一个任务，整体执行，不拆步骤；可选）")
-
-
-class PlanOutput(BaseModel):
-    """规划节点的结构化输出。"""
-
-    action: str = Field(description="create: 创建全新计划（替换旧计划）；update: 更新现有计划状态；complete: 反思通过，直接给答案")
-    title: str = Field(default="", description="计划标题")
-    tasks: list[PlanTask] = Field(default_factory=list, description="子任务列表（技能任务在任务上标注 skill_id）")
-    answer: str = Field(default="", description="action=complete 时的最终答案文本，其他情况为空字符串")
-
-
-async def _build_system_prompt(agent_descriptions: str = "", capability_descriptions: str = "") -> str:
-    """取规划节点系统提示词，并顺手记录**所用的 prompt 版本**（评估归因的关键维度）。
-
-    Langfuse 的 prompt 带版本号：写进 RunMeta 后，"这版 prompt 分数有没有变好"才能对比出来。
-    """
-    # Langfuse API 调用（网络 IO），异步
-    langfuse = Langfuse()
-
-    def _fetch():
-        prompt = langfuse.get_prompt("plan_node_system_prompt", type="text")
-        return prompt.compile(
-            agent_descriptions=agent_descriptions or "- general_agent: 通用执行 agent，可调用所有工具",
-            capability_descriptions=capability_descriptions or "",
-        ), int(getattr(prompt, "version", 0) or 0)
-
-    text, version = await asyncio.to_thread(_fetch)
-    from app.evaluation import update_meta
-
-    update_meta(run_prompt_version=f"langfuse:v{version}" if version else "langfuse:unknown")
-    return text
-
-
-def _to_subtask(t: PlanTask) -> SubTask:
-    """将 PlanTask 转换为 SubTask。"""
-    return SubTask(
-        plan_id=t.plan_id,
-        name=t.name,
-        desc=t.desc,
-        execution_agent=t.execution_agent,
-        sort=t.sort,
-        deps=t.deps,
-        skill_id=t.skill_id,
-    )
-
-
-#: 技能上下文探测任务的固定 plan_id（系统注入，模型不要创建）
-SKILL_PROBE_ID = "skill_probe"
-
-
-async def _skills_index_text() -> str:
-    """导出 <SkillsIndex> 文本（附在能力描述末尾，供 plan 感知可用技能）。
-
-    skills.enabled=false 时不注入（关闭技能链路，用于对比 token 消耗）。
-    """
-    from app.agents.skills import is_skills_enabled
-
-    if not is_skills_enabled():
-        return ""
-    try:
-        from app.agents.skills import skill_index_text
-        from app.agents.tools.registry import load_config_tools
-
-        available = {t.name for t in load_config_tools()}
-        from app.config import get_app_config
-
-        return skill_index_text(max_candidates=get_app_config().skills.max_candidates, available_tools=available)
-    except Exception:
-        return ""
-
-
-def _skill_ids_of(subtasks: list[SubTask]) -> list[str]:
-    """计划里出现过的技能 id（按任务顺序去重，主技能即第一个技能任务）。"""
-    seen: list[str] = []
-    for t in subtasks:
-        if t.skill_id and t.skill_id not in seen:
-            seen.append(t.skill_id)
-    return seen
-
-
-def _inject_skill_probe(subtasks: list[SubTask]) -> list[SubTask]:
-    """把「技能前置校验」作为 DAG 首任务注入，并让技能任务依赖它。
-
-    技能由**任务上的 `skill_id`** 表达（模型不再单独声明技能候选）：只要计划里出现了技能任务，
-    就注入一个前置校验任务（技能可用性 + 沙箱环境），让下游任务一开始就知道环境是否可用。
-
-    Args:
-        subtasks: 模型产出的业务任务。
-
-    Returns:
-        注入 skill_probe 后的任务列表（业务任务 deps 自动加 skill_probe）。
-    """
-    skill_ids = _skill_ids_of(subtasks)
-    if not skill_ids:
-        return subtasks
-    primary = skill_ids[0]
-    min_sort = min((t.sort for t in subtasks), default=0)
-    probe = SubTask(
-        plan_id=SKILL_PROBE_ID,
-        name=f"前置校验技能「{primary}」与沙箱环境",
-        desc=f"[skill_probe] {primary}；本计划涉及技能 {skill_ids}；系统校验技能可用性 + 沙箱环境并注入技能文件清单/错误规则，结果写回本任务",
-        execution_agent="general_agent",
-        sort=min_sort - 1,
-        deps=[],
-        skill_id=primary,
-    )
-    result: list[SubTask] = [probe]
-    for t in subtasks:
-        if SKILL_PROBE_ID not in t.deps:
-            t.deps = [SKILL_PROBE_ID, *t.deps]
-        result.append(t)
-    return result
-
-
 @dataclass
 class PlanRun:
-    """一次规划 agent 运行的结果（transcript + 结构化输出 + 澄清信息）。"""
+    """一次规划 agent 运行的结果（transcript + 提交的计划 + 澄清信息）。"""
 
     plan_output: PlanOutput | None = None
     new_messages: list[BaseMessage] = field(default_factory=list)
@@ -192,19 +70,23 @@ def _is_voice_mode() -> bool:
     return bool(voice_mode_ctx_var.get())
 
 
-async def _build_capability_desc() -> str:
-    """执行能力描述 + 技能索引（供规划节点感知可用工具与技能）。"""
-    capability = await describe_execute_tools()
-    skills_index = await _skills_index_text()
-    if not skills_index:
-        return capability
-    return f"{capability}\n\n{skills_index}" if capability else skills_index
+def _message_key(msg: BaseMessage) -> str:
+    """消息去重键（无 id 时退化为类型 + 内容）。"""
+    return getattr(msg, "id", None) or f"{type(msg).__name__}:{getattr(msg, 'content', '')}"
+
+
+def _text_of(chunk: Any) -> str:
+    """取流式 chunk 的文本增量（兼容 str 与 text-block 列表）。"""
+    content = getattr(chunk, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(str(b.get("text", "")) for b in content if isinstance(b, dict) and b.get("type") == "text")
+    return ""
 
 
 def _summarize_task_results(plan_tasks: list[SubTask], *, max_items: int = 5) -> str:
     """把已完成任务的结果汇总成答复（模型空输出时的兜底，排除系统内部任务）。"""
-    from app.agents.nodes.step_dispatch_node import INTERNAL_TASK_IDS
-
     useful = [t for t in plan_tasks if t.plan_id not in INTERNAL_TASK_IDS and t.result and t.result.strip() and t.step_statuses == "completed"]
     if not useful:
         return ""
@@ -216,18 +98,13 @@ def _summarize_task_results(plan_tasks: list[SubTask], *, max_items: int = 5) ->
 
 
 def _dump_plan_output(plan_output: PlanOutput | None) -> str:
-    """把结构化输出压缩成一行日志（排障用）。"""
+    """把计划压缩成一行日志（排障用）。"""
     if plan_output is None:
         return "None"
     try:
         return plan_output.model_dump_json()[:500]
     except Exception:  # pragma: no cover - 理论上不会失败
         return str(plan_output)[:500]
-
-
-def _render_plan_status(existing_tasks: list[SubTask]) -> str:
-    """把当前计划渲染成 <PlanStatus> 文本（review / replan 用）。"""
-    return "\n".join(f"- [{t.step_statuses}] plan_id: {t.plan_id}: 任务名称: {t.name}: 执行结果：【{t.result or '待执行'}】" for t in existing_tasks)
 
 
 async def _build_messages(state: ThreadState, context: GraphContext, plan_context: str) -> list[BaseMessage]:
@@ -247,52 +124,30 @@ async def _build_messages(state: ThreadState, context: GraphContext, plan_contex
     return messages
 
 
-def _message_key(msg: BaseMessage) -> str:
-    """消息去重键（无 id 时退化为类型 + 内容）。"""
-    return getattr(msg, "id", None) or f"{type(msg).__name__}:{getattr(msg, 'content', '')}"
-
-
-def _text_of(chunk: Any) -> str:
-    """取流式 chunk 的文本增量（兼容 str 与 text-block 列表）。"""
-    content = getattr(chunk, "content", None)
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(str(b.get("text", "")) for b in content if isinstance(b, dict) and b.get("type") == "text")
-    return ""
-
-
-def _coerce_plan_output(structured: Any) -> PlanOutput | None:
-    """把 structured_response 归一化为 PlanOutput。"""
-    if isinstance(structured, PlanOutput):
-        return structured
-    if isinstance(structured, dict):
-        try:
-            return PlanOutput.model_validate(structured)
-        except Exception:
-            return None
-    return None
+# ----------------------------------------------------------------------
+# 规划 agent：一次运行 = 澄清 / 提交计划 / 直接回答
+# ----------------------------------------------------------------------
 
 
 async def _run_plan_agent(config: RunnableConfig, messages: list[BaseMessage], out: Output) -> PlanRun:
-    """运行规划 agent（流式消费），返回结构化计划与本轮 transcript。
+    """运行规划 agent（流式消费），返回提交的计划与本轮 transcript。
 
     - ``messages`` 流：转发模型增量（打字机）+ 累积工具调用（实时展示执行动作）；
-    - ``updates`` 流：收集 transcript（含 tool 消息）、捕获结构化输出与澄清参数。
+    - ``updates`` 流：收集 transcript（含 tool 消息）、捕获 ``submit_plan`` 提交与澄清参数。
 
-    注意：transcript 以 ``updates`` 为准，不能用增量 chunk 重建（会丢 tool_calls / ToolMessage）。
+    注意：transcript 与计划提交都以 ``updates`` 为准 —— 增量 chunk 不完整（会丢 tool_calls），
+    工具参数也只有在完整 AIMessage 上才是可解析的。
     """
     agent = create_agent(
         create_llm_with_name(config, model_name="plan_node_model"),
-        await get_plan_tools(),
-        middleware=[DanglingToolCallMiddleware(), ClarificationMiddleware()],
+        [*await get_plan_tools(), submit_plan],  # 计划提交是普通工具：不依赖任何渠道特性
+        middleware=[DanglingToolCallMiddleware(), ClarificationMiddleware(), PlanSubmissionMiddleware()],
         name="plan_node_agent",
-        response_format=PlanOutput,
-        system_prompt=await _build_system_prompt(capability_descriptions=await _build_capability_desc()),
+        system_prompt=await build_system_prompt(capability_descriptions=await build_capability_desc()),
     )
 
     run = PlanRun()
-    accumulator = ToolCallAccumulator(ignore_names={"PlanOutput"})  # 结构化输出是内部机制，不对用户展示
+    accumulator = ToolCallAccumulator(ignore_names={SUBMIT_TOOL_NAME})  # 提交是内部协议，不作为"执行动作"展示
     collected: dict[str, BaseMessage] = {}
     input_ids = {m.id for m in messages if getattr(m, "id", None)}
 
@@ -313,20 +168,92 @@ async def _run_plan_agent(config: RunnableConfig, messages: list[BaseMessage], o
                 continue
             for msg in update.get("messages") or []:
                 collected[_message_key(msg)] = msg
-                if isinstance(msg, ToolMessage):
+                if isinstance(msg, AIMessage):
+                    _capture_submission(msg, run)
+                if isinstance(msg, ToolMessage) and msg.name != SUBMIT_TOOL_NAME:
                     out.tool_result(name=msg.name or "", result=str(msg.content or ""), ok=str(getattr(msg, "status", "")) != "error")
                     if msg.name == "ask_clarification" and not run.clarify_args:
                         run.clarify_args = {"question": str(msg.content or "")}
-            structured = update.get("structured_response")
-            if structured is not None:
-                run.plan_output = _coerce_plan_output(structured) or run.plan_output
 
     run.all_messages = list(collected.values())
     run.new_messages = [m for m in run.all_messages if getattr(m, "id", None) not in input_ids]
     run.has_clarification = any(isinstance(m, AIMessage) and any(tc.get("name") == "ask_clarification" for tc in (m.tool_calls or [])) for m in run.new_messages)
-    if run.plan_output is None:
-        run.plan_output = _extract_plan_output({"messages": run.all_messages})
+    if run.plan_output is None and not run.has_clarification:
+        logger.warning("[plan] 本轮没有收到合法的 submit_plan 提交（模型未按协议提交计划）")
     return run
+
+
+def _capture_submission(msg: AIMessage, run: PlanRun) -> None:
+    """从 AIMessage 的 ``submit_plan`` 调用里取出计划（非法参数由工具节点回给模型修正）。"""
+    for call in getattr(msg, "tool_calls", None) or []:
+        if call.get("name") != SUBMIT_TOOL_NAME:
+            continue
+        plan = parse_submission(call.get("args"))
+        if plan is not None:
+            run.plan_output = plan  # 重复提交时以最后一次合法提交为准
+
+
+# ----------------------------------------------------------------------
+# 评估触发（触发点 3：最终回复）
+# ----------------------------------------------------------------------
+
+
+async def _trigger_final_answer_eval(
+    *,
+    answer: str,
+    run: PlanRun,
+    existing_tasks: list[SubTask],
+    config: RunnableConfig,
+    runtime: Runtime[GraphContext],
+    trace_id: str,
+) -> None:
+    """**触发点 3**：最终回复评估（异步，不阻塞）。
+
+    用户只看到最终答复，所以这是闭环里最关键的一次评估：答复是否答对问题、是否有据、是否完整。
+    判定（阈值/开关）在调用层定，这里只负责把材料准备好交给评估器。
+    """
+    from app.agents.evaluators.final_answer_evaluator import FinalAnswerEvaluationInput, maybe_evaluate_final_answer
+
+    user_messages = [str(m.content) for m in (run.all_messages or []) if isinstance(m, HumanMessage) and isinstance(m.content, str) and m.content.strip()]
+    task_results = [{"plan_id": t.plan_id, "name": t.name, "status": t.step_statuses, "result": (t.result or "")[:1500], "blocked": t.blocked_message} for t in existing_tasks if t.plan_id != SKILL_PROBE_ID]
+    await maybe_evaluate_final_answer(
+        trace_id=trace_id,
+        eval_input=FinalAnswerEvaluationInput(
+            user_messages=user_messages[-3:],
+            final_answer=answer,
+            task_results=task_results,
+            plan_action=(run.plan_output.action if run.plan_output else ""),
+            plan_status=render_plan_status(existing_tasks),
+            # 只给"用户可见"的对话（去掉空 AIMessage、结构化输出等内部消息——judge 会被它们误导）
+            history=[{"type": type(m).__name__, "content": str(getattr(m, "content", ""))[:2000]} for m in (run.new_messages or []) if type(m).__name__ in ("HumanMessage", "AIMessage") and str(getattr(m, "content", "")).strip()],
+        ),
+        messages=run.all_messages or [],
+        config=config,
+        runtime=runtime,
+    )
+
+
+# ----------------------------------------------------------------------
+# 落库 + 事件
+# ----------------------------------------------------------------------
+
+
+def _plan_subtasks(plan_output: PlanOutput, existing_tasks: list[SubTask], out: Output) -> list[SubTask]:
+    """契约 → 运行期任务，并做 DAG 拓扑校验/修复（依赖指向不存在的任务会永久阻塞）。"""
+    subtasks = [to_subtask(t) for t in plan_output.tasks]
+    known_ids = {t.plan_id for t in existing_tasks} if plan_output.action == "update" else set()
+    for problem in validate_topology(plan_output, known_ids):
+        logger.warning("[plan] DAG 拓扑问题：{}", problem)
+    subtasks, notes = repair_topology(subtasks, known_ids)
+    for note in notes:
+        out.think(f"⚠️ {note}")
+
+    if plan_output.action == "create" or not any(t.plan_id == SKILL_PROBE_ID for t in existing_tasks):
+        before = len(subtasks)
+        subtasks = inject_skill_probe(subtasks)
+        if len(subtasks) > before:
+            out.think(f"📋 命中技能 {skill_ids_of(subtasks)[0]}，注入技能前置校验任务")
+    return subtasks
 
 
 async def _apply_plan_result(
@@ -336,17 +263,21 @@ async def _apply_plan_result(
     out: Output,
     config: RunnableConfig,
     trace_id: str,
+    runtime: Runtime[GraphContext] | None = None,
 ) -> dict:
     """按规划结果落库并向前端发事件（澄清 / 最终答复 / 规划 / 直接回复）。"""
-    from app.agents.skills import is_skills_enabled
-
     plan_output = run.plan_output
     model = _request_model(config)
 
     # 1) 澄清：描述不清，等用户补充（transcript 以干净 AIMessage 回复用户）
     if run.has_clarification:
         clean_msgs = _clean_clarification_messages(run.new_messages)
-        question = str(clean_msgs[-1].content) if clean_msgs else str(run.clarify_args.get("question", ""))
+        question = str(run.clarify_args.get("question") or "").strip()
+        if not question:
+            for m in reversed(clean_msgs):
+                if isinstance(m, AIMessage) and str(m.content or "").strip():
+                    question = str(m.content).strip()
+                    break
         out.clarify(
             content=question,
             clarification_type=str(run.clarify_args.get("clarification_type", "") or ""),
@@ -360,16 +291,13 @@ async def _apply_plan_result(
     if plan_output and plan_output.action == "complete" and plan_output.answer:
         out.answer(content=plan_output.answer)
         await track(TrackingType.PLAN_COMPLETE, TrackingPage.PLAN, model=model, p2="complete", p4=plan_output.answer[:200])
+        if runtime is not None:
+            await _trigger_final_answer_eval(answer=plan_output.answer, run=run, existing_tasks=existing_tasks, config=config, runtime=runtime, trace_id=trace_id)
         return {"messages": [AIMessage(content=plan_output.answer)], "completed": True, "plan_tasks": Overwrite(value=[])}
 
     # 3) 规划：有子任务 → 注入技能探测（如需）后写回计划
     if plan_output and plan_output.tasks:
-        subtasks = [_to_subtask(t) for t in plan_output.tasks]
-        skill_ids = _skill_ids_of(subtasks) if is_skills_enabled() else []
-        probe_exists = any(t.plan_id == SKILL_PROBE_ID for t in existing_tasks)
-        if skill_ids and (plan_output.action == "create" or not probe_exists):
-            subtasks = _inject_skill_probe(subtasks)
-            out.think(f"📋 命中技能 {skill_ids[0]}，注入技能前置校验任务")
+        subtasks = _plan_subtasks(plan_output, existing_tasks, out)
         out.plan(action=plan_output.action, title=plan_output.title, tasks=[t.model_dump() for t in subtasks])
         out.think(f"📋 规划完成，共 {len(subtasks)} 个子任务")
 
@@ -382,6 +310,8 @@ async def _apply_plan_result(
     # 4) 模型直接给了答案但没有子任务：包装成干净 AIMessage（避免内部 dump 上屏）
     if plan_output and plan_output.answer:
         out.answer(content=plan_output.answer)
+        if runtime is not None:
+            await _trigger_final_answer_eval(answer=plan_output.answer, run=run, existing_tasks=existing_tasks, config=config, runtime=runtime, trace_id=trace_id)
         return {"messages": [AIMessage(content=plan_output.answer)], "completed": True, "plan_tasks": Overwrite(value=[])}
 
     # 5) 兜底：模型既没给答案、也没有新任务（例如审查轮返回空输出）
@@ -392,11 +322,21 @@ async def _apply_plan_result(
     if summary:
         out.answer(content=summary)
         logger.warning("[plan] 模型未给出答复，已用已完成任务结果兜底（{} 字）", len(summary))
+        if runtime is not None:
+            await _trigger_final_answer_eval(answer=summary, run=run, existing_tasks=existing_tasks, config=config, runtime=runtime, trace_id=trace_id)
         return {"messages": [AIMessage(content=summary)], "completed": True, "plan_tasks": Overwrite(value=[])}
+
     logger.warning("[plan] 空输出且无可用结果（plan_output={}）", _dump_plan_output(plan_output))
     fallback = "这次没有产生可用的结果，请把问题再说清楚一些，或补充关键信息。"
     out.answer(content=fallback)
+    if runtime is not None:
+        await _trigger_final_answer_eval(answer=fallback, run=run, existing_tasks=existing_tasks, config=config, runtime=runtime, trace_id=trace_id)
     return {"messages": [AIMessage(content=fallback)], "completed": True, "plan_tasks": Overwrite(value=[])}
+
+
+# ----------------------------------------------------------------------
+# 节点入口
+# ----------------------------------------------------------------------
 
 
 async def plan_model_node(state: ThreadState, config: RunnableConfig, runtime: Runtime[GraphContext]) -> dict:
@@ -407,11 +347,11 @@ async def plan_model_node(state: ThreadState, config: RunnableConfig, runtime: R
     out.think("📋 分析问题中ing")
 
     existing_tasks = state.get("plan_tasks", [])
-    plan_context = _render_plan_status(existing_tasks)
+    plan_context = render_plan_status(existing_tasks)
     messages = await _build_messages(state, context, plan_context)
     eval_input = _capture_eval_input(messages=messages, plan_context=plan_context, current_time=context.current_time)
 
-    # 节点级重试由 LangGraph retry_policy 接管（见 lead_agent/agent.py）：
+    # 节点级重试由 LangGraph retry_policy 接管（见 app/agents/graph/agent.py）：
     # 可恢复错误 → raise 重试；不可恢复（欠费/认证）→ 返回友好提示。
     try:
         run = await _run_plan_agent(config, messages, out)
@@ -423,8 +363,7 @@ async def plan_model_node(state: ThreadState, config: RunnableConfig, runtime: R
             eval_input.tasks = [t.model_dump() for t in run.plan_output.tasks]
         # 身份与信号：评估结果要能归因（哪个任务/技能/prompt 版本），策略要能判断"值不值得评"
         from app.evaluation import update_meta
-        from app.llm.builders import \
-            _resolve_model_name  # noqa: PLC0415  (运行时解析角色名)
+        from app.llm.builders import _resolve_model_name  # noqa: PLC0415  (运行时解析角色名)
 
         skill_ids = [t.skill_id for t in (run.plan_output.tasks if run.plan_output else []) if getattr(t, "skill_id", "")]
         update_meta(
@@ -443,7 +382,7 @@ async def plan_model_node(state: ThreadState, config: RunnableConfig, runtime: R
         )
         await maybe_evaluate_plan(trace_id=trace_id, eval_input=eval_input, messages=messages, config=config, runtime=runtime)
 
-        return await _apply_plan_result(run=run, existing_tasks=existing_tasks, out=out, config=config, trace_id=trace_id)
+        return await _apply_plan_result(run=run, existing_tasks=existing_tasks, out=out, config=config, trace_id=trace_id, runtime=runtime)
 
     except Exception as e:
         retriable, reason = classify_llm_error(e)
@@ -455,68 +394,8 @@ async def plan_model_node(state: ThreadState, config: RunnableConfig, runtime: R
         return Command(update={"messages": [message], "completed": True}, goto="END")
 
 
-def _extract_plan_output(agent_output: dict) -> PlanOutput | None:
-    """从 agent 输出中提取结构化计划。
-
-    兼容两种形态：
-      1. 模型原生支持 structured output → PlanOutput 在最终 AIMessage 的 content/additional_kwargs 里
-      2. 模型不支持（如 deepseek-v4-flash）→ LangChain fallback 到 tool-call 实现，
-         真正解析结果存于 state 的 "structured_response" 字段，message 里只有
-         "Returning structured response: ..." 的 ToolMessage
-    """
-    if not isinstance(agent_output, dict):
-        return None
-
-    # 1. 首选：fallback 模式（tool-call 实现）下的结构化响应
-    structured = agent_output.get("structured_response")
-    if structured is not None:
-        if isinstance(structured, PlanOutput):
-            return structured
-        if isinstance(structured, dict):
-            try:
-                return PlanOutput.model_validate(structured)
-            except Exception:
-                pass
-
-    # 2. 原生 JSON schema 模式：从 AIMessage content 解析
-    messages = agent_output.get("messages", [])
-    if not messages:
-        return None
-    for msg in reversed(messages):
-        if isinstance(msg, AIMessage):
-            plan = _try_parse_plan(msg)
-            if plan:
-                return plan
-    return None
-
-
-def _try_parse_plan(msg: AIMessage) -> PlanOutput | None:
-    """尝试从 AIMessage 解析 PlanOutput。"""
-
-    # 1. 结构化输出注入到 content（JSON 字符串）
-    content = getattr(msg, "content", None)
-    if isinstance(content, str) and content.strip():
-        try:
-            return PlanOutput.model_validate_json(content)
-        except Exception:
-            pass
-
-    # 2. additional_kwargs 里的 parsed
-    try:
-        kwargs = getattr(msg, "additional_kwargs", {}) or {}
-        for key in ("parsed", "tool_call", "structured_output"):
-            if key in kwargs:
-                val = kwargs[key]
-                if isinstance(val, dict):
-                    return PlanOutput.model_validate(val)
-    except Exception:
-        pass
-
-    return None
-
-
 # ----------------------------------------------------------------------
-# 澄清消息清理
+# 辅助
 # ----------------------------------------------------------------------
 
 
@@ -560,11 +439,6 @@ def _clean_clarification_messages(agent_msgs: list[BaseMessage]) -> list[BaseMes
     if clarification_text:
         kept.append(AIMessage(content=clarification_text))
     return kept
-
-
-# ----------------------------------------------------------------------
-# 规划评估输入捕获
-# ----------------------------------------------------------------------
 
 
 def _capture_eval_input(

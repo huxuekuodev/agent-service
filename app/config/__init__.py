@@ -95,7 +95,7 @@ class EvaluatorSettings:
     字段语义与 ``models`` 列表项对齐：
       - ``name``: 评估器唯一名（registry 里按此注册，节点通过名字取用）。
       - ``display_name``: 展示名（Langfuse observation 名默认用它）。
-      - ``use``: BaseEvaluator 子类的 import 路径，如 ``app.agents.evaluation.plan_evaluator:PlanEvaluator``。
+      - ``use``: BaseEvaluator 子类的 import 路径，如 ``app.agents.evaluators.plan_evaluator:PlanEvaluator``。
       - ``model``: 评估 LLM 在 ``models`` 列表里的 name；省略时用默认模型。
       - ``system_prompt``: 评估 LLM 的系统提示词（可定制）。
       - ``enabled``: 总开关。
@@ -284,13 +284,13 @@ class TokenPricingConfig:
 class SkillSandboxConfig:
     """Skill 沙箱配置（config.yaml ``skills.sandbox``）。
 
-    三个 E2B 变量支持环境变量兜底（.env / 宿主环境）：
-      - ``E2B_TEMPLATE``：模板名（config 未填 template 时使用）
-      - ``E2B_API_KEY``：SDK 鉴权（SkillSandbox 创建时校验）
-      - ``E2B_DOMAIN``：自托管域名（SDK 自行读取）
+    两种后端（``backend``）：
+      - ``docker``（默认）：**一次性容器**跑技能脚本，省钱、可控（见 docs/SKILL_方案.md）；
+      - ``e2b``：云端 E2B 沙箱（可选回退，需装 ``e2b-code-interpreter`` 并配 E2B_* 环境变量）。
 
-    仅当可选依赖 ``e2b-code-interpreter`` 已安装、template 非空、宿主环境存在 E2B_API_KEY
-    时沙箱可用。skill 自带的脚本在沙箱内运行，调用注册工具的步骤仍在本地执行。
+    Docker 后端要点：镜像用现成的 ``python:3.11``；容器**根文件系统只读**，只把宿主机的技能目录
+    以**只读**方式挂进容器（``/workspace/<skill_id>``），可写区只有 tmpfs ``/tmp``；网络走宿主网络；
+    单条命令超时即 **kill 容器**；技能跑完删除容器。
     """
 
     enabled: bool = False
@@ -298,14 +298,33 @@ class SkillSandboxConfig:
     """E2B 沙箱模板名（config 未填时读环境变量 E2B_TEMPLATE）。"""
     timeout: int = 3600
     """沙箱最长存活秒数。"""
-    command_timeout: int = 120
-    """单条命令默认超时秒数。"""
     max_output_chars: int = 30000
     """单次执行 stdout/stderr 回传给 LLM 的最大字符数（0 = 不截断）。"""
     session_ttl_seconds: int = 1800
     """沙箱会话空闲存活秒数：超时未使用则自动销毁（LLM 也可主动 sandbox_close）。"""
     max_sessions: int = 4
     """同时存活的沙箱会话数上限（超出时回收最久未用者）。"""
+    backend: str = "docker"
+    """沙箱后端：docker（默认，一次性容器）/ e2b（云端，可选回退）。"""
+    docker_url: str = "$DOCKER_HOST_URL"
+    """Docker 守护进程地址：``ssh://user@host:22`` 或 ``unix:///var/run/docker.sock``。
+    走 ssh 时**必须用 paramiko 传输**（``use_ssh_client=False``）—— ssh CLI 传输下 exec/put_archive 会挂死（实测）。"""
+    docker_image: str = "python:3.11"
+    """技能脚本镜像（需已存在于目标 Docker 主机）。"""
+    docker_network_mode: str = "host"
+    """容器网络模式：host（依赖宿主机网络）/ bridge / none。"""
+    host_tmp_dir: str = "/tmp/deer-skills"
+    """宿主机技能目录根（按天分目录：``<host_tmp_dir>/<YYYY-MM-DD>/<skill_id>``）。"""
+    command_timeout: int = 5
+    """单条命令超时秒数；超时即 kill 并删除容器（默认 5s）。"""
+    mem_limit: str = "256m"
+    """容器内存上限（防脚本吃光宿主机）。"""
+    pids_limit: int = 128
+    """容器进程数上限。"""
+    tmpfs_size: str = "64m"
+    """容器内可写 /tmp 的大小上限（根文件系统只读，仅 /tmp 可写）。"""
+    keep_host_files_days: int = 2
+    """宿主机技能目录保留天数（按天目录，过期目录会被清理）。"""
     env_keys: list[str] = field(default_factory=list)
     """允许从宿主环境注入沙箱的环境变量白名单（如 QWEATHER_API_KEY）。"""
     exclude_patterns: list[str] = field(default_factory=lambda: [".env*", "*.pem", "*.key", "*.p12", ".git/*", "__pycache__/*", "*.pyc", ".venv/*", "node_modules/*"])
@@ -322,10 +341,19 @@ class SkillSandboxConfig:
             enabled=enabled,
             template=template,
             timeout=int(d.get("timeout", 3600)),
-            command_timeout=int(d.get("command_timeout", 120)),
             max_output_chars=int(d.get("max_output_chars", 30000)),
             session_ttl_seconds=max(60, int(d.get("session_ttl_seconds", 1800) or 1800)),
             max_sessions=max(1, int(d.get("max_sessions", 4) or 4)),
+            backend=str(d.get("backend", "docker") or "docker").lower(),
+            docker_url=str(_resolve_env(d.get("docker_url", "$DOCKER_HOST_URL")) or ""),
+            docker_image=str(d.get("docker_image", "python:3.11") or "python:3.11"),
+            docker_network_mode=str(d.get("docker_network_mode", "host") or "host"),
+            host_tmp_dir=str(d.get("host_tmp_dir", "/tmp/deer-skills") or "/tmp/deer-skills"),
+            command_timeout=max(1, int(d.get("command_timeout", 5) or 5)),
+            mem_limit=str(d.get("mem_limit", "256m") or "256m"),
+            pids_limit=max(16, int(d.get("pids_limit", 128) or 128)),
+            tmpfs_size=str(d.get("tmpfs_size", "64m") or "64m"),
+            keep_host_files_days=max(1, int(d.get("keep_host_files_days", 2) or 2)),
             env_keys=list(d.get("env_keys") or []),
             exclude_patterns=list(d.get("exclude_patterns") or cls().exclude_patterns),
         )
@@ -384,8 +412,13 @@ class EvaluationPolicyConfig:
     默认 ``worth_it``：只在出过问题或信息量大的轮次评估，其余按 ``baseline_sample_rate`` 抽样。
     """
 
-    mode: str = "worth_it"
-    """worth_it（值得评才评）/ always（全量）/ off（不评）。"""
+    mode: str = "always"
+    """always（测试阶段：全部触发）/ worth_it（只评有信号的轮次）/ off（不评）。"""
+    triggers: dict[str, bool] = field(default_factory=lambda: {"plan_done": True, "task_done": True, "final_answer": True})
+    """三个触发点开关：规划完成 / 每个任务完成 / 最终回复。"""
+    thresholds: dict[str, Any] = field(default_factory=dict)
+    """阈值（在**调用 agent 时**生效）：sample_rate（链级采样）/ min_task_count（任务数门槛）
+    / max_task_evals（单链任务评估次数上限）/ max_evals_per_run（单链评估总次数上限）。"""
     baseline_sample_rate: float = 0.05
     """worth_it 模式下，对"普通轮次"的抽样率（0 = 完全不评）。"""
     async_enabled: bool = True
@@ -398,11 +431,16 @@ class EvaluationPolicyConfig:
     @classmethod
     def from_dict(cls, d: dict | None) -> EvaluationPolicyConfig:
         d = d or {}
-        mode = str(d.get("mode", "worth_it") or "worth_it").lower()
+        mode = str(d.get("mode", "always") or "always").lower()
         if mode not in ("worth_it", "always", "off"):
             raise ValueError(f"evaluation_policy.mode 只支持 worth_it / always / off，当前: {mode}")
+        default_triggers = {"plan_done": True, "task_done": True, "final_answer": True}
+        triggers = {**default_triggers, **{str(k): bool(v) for k, v in (d.get("triggers") or {}).items()}}
+        thresholds = {str(k): v for k, v in (d.get("thresholds") or {}).items()}
         return cls(
             mode=mode,
+            triggers=triggers,
+            thresholds=thresholds,
             baseline_sample_rate=min(1.0, max(0.0, float(d.get("baseline_sample_rate", 0.05) or 0.0))),
             async_enabled=bool(d.get("async_enabled", True)),
             max_concurrency=max(1, int(d.get("max_concurrency", 2) or 2)),

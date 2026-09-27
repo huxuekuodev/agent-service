@@ -2,7 +2,7 @@
 
     - ``list_skills``      列出可用技能（skill_id + 何时使用）
     - ``load_skill``       读取**整份技能**（SKILL.md 全文 + 参考文档 + 文件清单 + 错误/清理规则）
-    - ``sandbox_create``   准备沙箱：环境校验 → 建沙箱 → 同步技能目录 → 报"环境就绪"
+    - ``sandbox_create``   准备沙箱：环境校验 → 建一次性容器 → 准备技能目录（宿主机已有则跳过上传）→ 报"环境就绪"
     - ``sandbox_run``      在已就绪的沙箱里执行命令（脚本/查看输出/自检），同一技能复用沙箱
     - ``sandbox_close``    销毁沙箱（未显式关闭时按空闲 TTL 自动回收）
     - ``sandbox_list``     查看当前存活的沙箱会话
@@ -10,7 +10,8 @@
 
 执行模型（**不拆分步骤**）：一个 skill 就是一个完整执行单元。执行 LLM 先 ``load_skill``
 读完整份 SKILL.md（里面写着怎么跑、跑哪些脚本、产出什么），再 ``sandbox_create`` 准备环境，
-用 ``sandbox_run`` 依次执行（脚本一律沙箱内运行），最后汇总结果并 ``sandbox_close``。
+用 ``sandbox_run`` 依次执行（脚本一律沙箱内运行：Docker 一次性容器，根文件系统只读 + 宿主网络 + 超时 kill），
+最后汇总结果并 ``sandbox_close``（任务结束时框架也会自动回收）。
 注册工具（``requires_tools`` 声明的）仍在**本地**执行，不进沙箱。
 """
 
@@ -99,7 +100,8 @@ async def load_skill(skill_id: str) -> str:
 
 @tool(parse_docstring=True)
 async def sandbox_create(skill_id: str, recreate: bool = False) -> str:
-    """Prepare the skill sandbox: check the sandbox environment, start a sandbox and upload the whole skill directory (scripts/data/reference).
+    """Prepare the skill sandbox: check the sandbox environment, start a sandbox and upload the whole skill directory (scripts/data/reference) into the sandbox.
+    The skill directory is cached on the docker host per day, so reuse within the same day skips the upload.
 
     Call this once before running any skill script. Repeated calls reuse the existing
     sandbox (fast); set recreate=True only after the skill files changed.

@@ -438,6 +438,11 @@ export function monitorEvalTrend({ metric = '', dimension = 'run_prompt_version'
   return request(`/evaluations/trend?${qs}`, {}, MONITOR)
 }
 
+/** 评估链视图（一次回合触发了哪些评估点） */
+export function monitorEvalRuns(limit = 10) {
+  return request(`/evaluations/runs?limit=${limit}`, {}, MONITOR).then((d) => d?.runs ?? [])
+}
+
 /** 低分案例（含完整上下文，可直接拿去改 prompt/技能） */
 export function monitorEvalBadCases({ metric = '', evaluator = '', limit = 20 } = {}) {
   const qs = new URLSearchParams({ limit })

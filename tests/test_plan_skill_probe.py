@@ -6,15 +6,10 @@
 
 from __future__ import annotations
 
-from app.agents.nodes.plan_model_node import (
-    SKILL_PROBE_ID,
-    PlanOutput,
-    PlanTask,
-    _inject_skill_probe,
-    _skill_ids_of,
-    _summarize_task_results,
-)
-from app.agents.subtask import SubTask
+from app.agents.plan.dag import inject_skill_probe, skill_ids_of
+from app.agents.plan.node import _summarize_task_results
+from app.agents.plan.schema import SKILL_PROBE_ID, PlanOutput, PlanTask
+from app.agents.state.subtask import SubTask
 
 
 def test_plan_output_has_no_skills_field() -> None:
@@ -36,16 +31,16 @@ def test_skill_ids_collected_in_task_order_without_duplicates() -> None:
         SubTask(plan_id="task3", skill_id="query-weather"),
         SubTask(plan_id="task4", skill_id="yuque-diff"),
     ]
-    assert _skill_ids_of(tasks) == ["query-weather", "yuque-diff"]
-    assert _skill_ids_of([SubTask(plan_id="task1")]) == []
+    assert skill_ids_of(tasks) == ["query-weather", "yuque-diff"]
+    assert skill_ids_of([SubTask(plan_id="task1")]) == []
 
 
 def test_probe_injected_only_when_skill_task_exists() -> None:
     plain = [SubTask(plan_id="task1", name="普通任务")]
-    assert _inject_skill_probe(plain) == plain
+    assert inject_skill_probe(plain) == plain
 
     tasks = [SubTask(plan_id="task1", name="查天气", skill_id="query-weather")]
-    result = _inject_skill_probe(tasks)
+    result = inject_skill_probe(tasks)
     assert [t.plan_id for t in result] == [SKILL_PROBE_ID, "task1"]
     probe = result[0]
     assert probe.skill_id == "query-weather" and probe.deps == []
@@ -58,7 +53,7 @@ def test_probe_not_duplicated_and_deps_preserved() -> None:
         SubTask(plan_id="task1", name="A", skill_id="query-weather"),
         SubTask(plan_id="task2", name="B", skill_id="query-weather", deps=["task1"]),
     ]
-    result = _inject_skill_probe(tasks)
+    result = inject_skill_probe(tasks)
     assert [t.plan_id for t in result].count(SKILL_PROBE_ID) == 1
     # 已有依赖保持原样，probe 前置
     assert result[2].deps == [SKILL_PROBE_ID, "task1"]
@@ -71,7 +66,7 @@ def test_probe_uses_first_skill_as_primary() -> None:
         SubTask(plan_id="task1", name="A", skill_id="query-weather"),
         SubTask(plan_id="task2", name="B", skill_id="yuque-diff"),
     ]
-    probe = _inject_skill_probe(tasks)[0]
+    probe = inject_skill_probe(tasks)[0]
     assert probe.skill_id == "query-weather"
     assert "yuque-diff" in probe.desc
 

@@ -14,8 +14,8 @@ from typing import Any
 from langchain_core.messages import HumanMessage
 from langgraph.types import Overwrite
 
-from app.agents.interrupts import INTERRUPT_EVENT_TYPE, extract_interrupt
-from app.agents.lead_agent.agent import GraphAgent
+from app.agents.common.interrupts import INTERRUPT_EVENT_TYPE, extract_interrupt
+from app.agents.graph.agent import GraphAgent
 from app.config import get_app_config
 from app.core.checkpointer import create_checkpointer
 from app.core.context import trace_id_ctx_var, voice_mode_ctx_var
@@ -193,6 +193,7 @@ class AgentService:
         resume: Any = _NO_RESUME,
         usage: Any = None,
         voice: bool = False,
+        run_id: str | None = None,
     ):
         """发送消息（或恢复中断）并流式返回事件。
 
@@ -210,10 +211,19 @@ class AgentService:
             resume: 恢复挂起的运行（``Command(resume=<用户答复>)``）。
             usage: 可选用量采集器（``app.llm.usage.UsageCollector``）。
             voice: 是否语音通话模式（节点会改用口语化短句回答，便于朗读）。
+            run_id: 评估链 id（``/resume`` 继续同一次用户回合时传入，保证三个触发点同链）。
         """
         agent = self._require_agent()
         trace_id = trace_id_ctx_var.get() or uuid.uuid4().hex
         token = voice_mode_ctx_var.set(bool(voice))
+
+        # **调用 agent 的这一层**一次性决定评估策略（是否评、哪些触发点、阈值），
+        # 并开一条评估链（run_id）；节点内部不再各自判断，保证"触发即完整链条"。
+        from app.evaluation import begin_run
+
+        decision = begin_run(run_id=run_id)
+        if not decision.enabled:
+            logger.debug("[evaluation] 本回合不纳入评估: {}", decision.reason)
 
         try:
             async for event in self._stream_events(agent, thread_id, message, trace_id=trace_id, usage=usage, resume=resume):

@@ -98,6 +98,16 @@ class SessionService:
             raise BizError(SESSION_NOT_FOUND, "会话不存在")
         return row
 
+    async def set_eval_run_id(self, session: dict[str, Any], run_id: str) -> None:
+        """把评估链 id 写进会话 meta（``/resume`` 继续同一回合时复用，保证链条不断）。"""
+        await self._safe(store.update_session_meta(session["session_id"], user_id=session["user_id"], patch={"eval_run_id": run_id}), what="评估链 id")
+
+    @staticmethod
+    def eval_run_id(session: dict[str, Any]) -> str:
+        """取会话当前的评估链 id（没有则空串）。"""
+        meta = session.get("meta") or {}
+        return str(meta.get("eval_run_id") or "")
+
     async def delete(self, session_id: str, *, user_id: str) -> dict[str, Any]:
         """逻辑删除会话，返回被删会话（``thread_id`` 供调用方清理 checkpoint）。"""
         row = await store.soft_delete_session(session_id, user_id=user_id)

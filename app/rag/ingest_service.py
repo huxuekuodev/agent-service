@@ -22,7 +22,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 
 from app.config import AppConfig
 from app.core.log import logger
-from app.model.data.yuque.yuque import YuqueClient, YuqueDoc, YuqueError, YuqueRepo
+from app.integrations.yuque.client import YuqueClient, YuqueDoc, YuqueError, YuqueRepo
 from app.rag.embedding import EmbeddingClient
 from app.rag.es_store import ElasticsearchStore
 from app.rag.image_classifier import classify_image_description, describe_image_from_bytes
